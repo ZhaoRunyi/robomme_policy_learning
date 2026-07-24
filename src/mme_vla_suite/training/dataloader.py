@@ -68,8 +68,7 @@ def create_data_loader(
     history_config = get_history_config(history_config)
 
     if temporal_blocks is not None:
-        dataset = RoboTTTSequenceDataset(
-            dataset_path, data_config, temporal_blocks, history_config.recurrent_memory.tbptt_segment_length)
+        dataset = RoboTTTSequenceDataset(dataset_path, data_config, temporal_blocks)
     else:
         dataset = RoboMMEDataset(dataset_path, data_config, history_config, action_horizon)
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)

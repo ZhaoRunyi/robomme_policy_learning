@@ -281,14 +281,13 @@ class RoboMMEDataset(Dataset):
 
 
 class RoboTTTSequenceDataset(Dataset):
-    def __init__(self, manifest_path, data_config, temporal_blocks, segment_length):
+    def __init__(self, manifest_path, data_config, temporal_blocks):
         manifest = json.load(open(manifest_path))
         if manifest["max_phase_aligned_blocks"] > 96:
             raise ValueError("RoboTTT manifest exceeds the approved T96 horizon")
         self.episodes = manifest["episodes"]
         self.ends = [episode["cumulative_execution_count"] for episode in self.episodes]
         self.temporal_blocks = temporal_blocks
-        self.segment_length = 1 if temporal_blocks == 1 else segment_length
         self.files = {}
         model_transforms = data_config.model_transforms.inputs
         self.transform = _transforms.compose(
@@ -344,12 +343,8 @@ class RoboTTTSequenceDataset(Dataset):
             blocks.append(block)
         sequence = jax.tree.map(lambda *values: np.stack(values), *blocks)
 
-        segment_length = self.segment_length
-        first_execution = int(np.sum(is_video))
-        left_padding = (segment_length - 1 - first_execution) % segment_length
-        target_segments = 1 + (self.temporal_blocks - 1 + segment_length - 1) // segment_length
-        right_padding = target_segments * segment_length - left_padding - len(block_indices)
-        padding = (left_padding, right_padding)
+        right_padding = self.temporal_blocks - len(block_indices)
+        padding = (0, right_padding)
         packed = jax.tree.map(
             lambda value: np.pad(value, [padding] + [(0, 0)] * (value.ndim - 1)),
             sequence,
