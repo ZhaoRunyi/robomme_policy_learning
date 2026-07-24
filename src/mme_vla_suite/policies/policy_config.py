@@ -14,7 +14,6 @@ import mme_vla_suite.policies.policy as _policy
 import mme_vla_suite.training.config as _config
 
 
-
 def create_trained_policy(
     train_config: _config.TrainConfig,
     checkpoint_dir: pathlib.Path | str,
@@ -44,7 +43,8 @@ def create_trained_policy(
     
 
     logging.info("Loading model...")
-    model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+    restore_dtype = None if "robottt" in str(train_config.model.history_config) else jnp.bfloat16
+    model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=restore_dtype))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     
     if norm_stats is None:

@@ -30,6 +30,7 @@ class WebsocketPolicyServer:
         self._host = host
         self._port = port
         self._metadata = metadata or {}
+        self._active_connection = False
         logging.getLogger("websockets.server").setLevel(logging.INFO)
 
     def serve_forever(self) -> None:
@@ -47,6 +48,10 @@ class WebsocketPolicyServer:
             await server.serve_forever()
 
     async def _handler(self, websocket: _server.ServerConnection):
+        if self._active_connection:
+            await websocket.close(code=1013, reason="RoboTTT state already has a client")
+            return
+        self._active_connection = self._policy._uses_robottt
         logger.info(f"Connection from {websocket.remote_address} opened")
         packer = msgpack_numpy.Packer()
 
@@ -58,7 +63,7 @@ class WebsocketPolicyServer:
                 
                 if obs.get("reset", False):
                     tstart = time.monotonic()
-                    self._policy.reset()
+                    self._policy.reset(obs.get("robottt_mode", "normal"))
                     tend = time.monotonic() - tstart
                     await websocket.send(packer.pack(
                         {"reset_finished": True, "reset_time_ms": tend * 1000}))
@@ -74,8 +79,10 @@ class WebsocketPolicyServer:
 
             except websockets.ConnectionClosed:
                 logger.info(f"Connection from {websocket.remote_address} closed")
+                self._active_connection = False
                 break
             except Exception:
+                self._active_connection = False
                 await websocket.send(traceback.format_exc())
                 await websocket.close(
                     code=websockets.frames.CloseCode.INTERNAL_ERROR,

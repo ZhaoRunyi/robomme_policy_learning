@@ -68,7 +68,9 @@ class MyPolicy_for_CVPR_Challenge(Policy):
 
         add_buffer_payload = {
             "images": np.stack(inputs["front_rgb_list"], axis=0).astype(np.uint8)[:, None],
+            "wrist_images": np.stack(inputs["wrist_rgb_list"], axis=0).astype(np.uint8)[:, None],
             "state": np.stack(robot_state_list, axis=0).astype(np.float32), # this is actually not used in the MME-VLA-Suite model
+            "prompt": inputs["task_goal"][0].lower(),
         }
         if inputs["is_first_step"]:
             exec_start_idx = len(inputs["front_rgb_list"]) - 1

@@ -1,0 +1,7 @@
+streaming_obs_horizon: 16
+integration_type: layer
+representation_type: recurrent
+use_state_emb: false
+recurrent_memory:
+  type: robottt
+  tbptt_segment_length: 4

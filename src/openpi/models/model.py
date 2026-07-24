@@ -148,6 +148,7 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    augmentation_group_size: int = 1,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
@@ -180,7 +181,9 @@ def preprocess_observation(
             transforms += [
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
-            sub_rngs = jax.random.split(rng, image.shape[0])
+            sub_rngs = jnp.repeat(
+                jax.random.split(rng, image.shape[0] // augmentation_group_size),
+                augmentation_group_size, axis=0)
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
             # Back to [-1, 1].

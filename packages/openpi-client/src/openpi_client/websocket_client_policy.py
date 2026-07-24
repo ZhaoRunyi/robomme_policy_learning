@@ -8,8 +8,6 @@ import websockets.sync.client
 from openpi_client import base_policy as _base_policy
 from openpi_client import msgpack_numpy
 
-import numpy as np
-
 class WebsocketClientPolicy(_base_policy.BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.
 
@@ -26,6 +24,9 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
 
     def get_server_metadata(self) -> Dict:
         return self._server_metadata
+
+    def close(self) -> None:
+        self._ws.close()
 
     def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
         logging.info(f"Waiting for server at {self._uri}...")
@@ -68,8 +69,8 @@ class MMEVLAWebsocketClientPolicy(WebsocketClientPolicy):
             raise RuntimeError(f"Error in inference server:\n{response}")
         return msgpack_numpy.unpackb(response)
     
-    def reset(self) -> None:
-        data = self._packer.pack({"reset": True})
+    def reset(self, robottt_mode: Optional[str] = None) -> Dict:
+        data = self._packer.pack({"reset": True, "robottt_mode": robottt_mode or "normal"})
         self._ws.send(data)
         response = self._ws.recv()
         return msgpack_numpy.unpackb(response)

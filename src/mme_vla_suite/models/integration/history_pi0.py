@@ -153,6 +153,10 @@ class HistoryPi0Config(Pi0Config):
                             jnp.float32,
                         ),
                     )
+                elif self.history_config.representation_type == "recurrent" and (
+                    self.history_config.recurrent_memory.type == "robottt"
+                ):
+                    observation_spec = HistAugObservation.from_base_obs(base_obs_spec)
                 elif self.history_config.representation_type == "recurrent":
                     observation_spec = HistAugObservation.from_base_obs(
                         base_obs_spec,
@@ -243,12 +247,13 @@ class HistoryPi0(BaseModel):
 
         self.config = config
         self.use_history = config.use_history
+        self.use_robottt = False
         
         if self.use_history:
             self.history_config = config.history_config
             self.integration_type = config.history_config.integration_type
             self.representation_type = config.history_config.representation_type
-            assert self.integration_type in ["context", "modulation", "expert"]
+            assert self.integration_type in ["context", "modulation", "expert", "layer"]
             assert self.representation_type in ["perceptual", "recurrent", "symbolic"]
 
             if self.representation_type == "perceptual":
@@ -262,15 +267,15 @@ class HistoryPi0(BaseModel):
                     dtype=config.dtype,
                 )
             elif self.representation_type == "recurrent":
-                from mme_vla_suite.models.representation.recur_mem import (
-                    RecurrentMemory,
-                )
+                self.use_robottt = self.history_config.recurrent_memory.type == "robottt"
+                if not self.use_robottt:
+                    from mme_vla_suite.models.representation.recur_mem import RecurrentMemory
 
-                self.mem_encoder = RecurrentMemory(
-                    config=self.history_config,
-                    rngs=rngs,
-                    dtype=config.dtype,
-                )
+                    self.mem_encoder = RecurrentMemory(
+                        config=self.history_config,
+                        rngs=rngs,
+                        dtype=config.dtype,
+                    )
             elif self.representation_type == "symbolic":
                 self.integration_type = (
                     None  # if symbolic, we only use it as languge input
@@ -363,6 +368,9 @@ class HistoryPi0(BaseModel):
         )
 
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+        if self.use_robottt:
+            register_tokens = jax.random.normal(rngs.params(), (16, action_expert_config.width))
+            self.robottt_register_tokens = nnx.Param(register_tokens / jnp.sqrt(action_expert_config.width))
         self.action_in_proj = nnx.Linear(
             config.action_dim, action_expert_config.width, rngs=rngs
         )
@@ -546,6 +554,13 @@ class HistoryPi0(BaseModel):
         # image/language/state inputs do not attend to action tokens
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         na_mask += [False] * self.action_horizon
+        if self.use_robottt:
+            registers = jnp.broadcast_to(self.robottt_register_tokens.value[None],
+                                         (obs.state.shape[0], 16, self.action_in_proj.out_features))
+            tokens.append(registers)
+            input_mask.append(jnp.ones(registers.shape[:2], dtype=jnp.bool_))
+            ar_mask += [True] + [False] * 15
+            na_mask += [False] * 16
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
 
@@ -561,19 +576,31 @@ class HistoryPi0(BaseModel):
         actions: Actions,
         *,
         train: bool = False,
+        robottt=None,
+        prefix=None,
     ) -> at.Float[at.Array, "*b ah"]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = preprocess_observation(preprocess_rng, observation, train=train)
+        if self.use_robottt:
+            noise_rng, time_rng = jax.random.split(rng)
+            fast_state, inner_token_mask, block_position = robottt
+        else:
+            fast_state = inner_token_mask = block_position = None
+            preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+            observation = preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        if self.use_robottt:
+            execution = jnp.any(inner_token_mask[:, : self.action_horizon], axis=-1)
+            time = jnp.where(execution, time, 0.1)
         time_expanded = time[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        if self.use_robottt:
+            x_t = jnp.where(execution[:, None, None], x_t, 0)
         u_t = noise - actions
         # one big forward pass of prefix + suffix at once
         prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, stats = (
-            self.embed_prefix(observation)
+            self.embed_prefix(observation) if prefix is None else prefix
         )
         suffix_tokens, suffix_mask, suffix_ar_mask, suffix_na_mask, adarms_cond = (
             self.embed_suffix(observation, x_t, time)
@@ -624,18 +651,81 @@ class HistoryPi0(BaseModel):
                 mem_mask=[None, mem_mask],
             )
         else:
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            llm_result = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
                 positions=positions,
                 adarms_cond=[None, adarms_cond],
+                robottt=(fast_state, inner_token_mask, block_position) if self.use_robottt else None,
             )
+            prefix_out, suffix_out = llm_result[0]
+            fast_state = llm_result[2] if self.use_robottt else None
 
-        v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+        action_start = 0 if self.use_robottt else -self.action_horizon
+        action_stop = self.action_horizon if self.use_robottt else None
+        action_out = suffix_out[:, action_start:action_stop]
+        v_t = self.action_out_proj(action_out)
         
         # import pdb; pdb.set_trace()
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1), stats
+        loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        return (loss, fast_state) if self.use_robottt else (loss, stats)
+
+    def compute_robottt_segment_loss(
+        self, rng, segment_index, observation, actions, masks, state, position, train=True):
+        batch_size, slot_count = actions.shape[:2]
+        observation = jax.tree.map(
+            lambda value: value.reshape((batch_size * slot_count, *value.shape[2:])), observation)
+        observation = preprocess_observation(
+            jax.random.fold_in(rng, 0), observation, train=train, augmentation_group_size=slot_count)
+        observation = jax.tree.map(
+            lambda value: value.reshape((batch_size, slot_count, *value.shape[1:])), observation)
+        prefixes = None
+        if os.environ.get("ROBOTTT_PREFIX_BATCHING") == "1":
+            flat_observation = jax.tree.map(
+                lambda value: value.reshape((batch_size * slot_count, *value.shape[2:])), observation)
+            prefixes = jax.tree.map(
+                lambda value: (
+                    value
+                    if not hasattr(value, "ndim") or value.ndim <= 1
+                    else value.reshape((batch_size, slot_count, *value.shape[1:]))
+                ),
+                self.embed_prefix(flat_observation),
+            )
+
+        def block(carry, slot_index):
+            state, position, numerator, count = carry
+            loss, state = self.compute_loss(
+                jax.random.fold_in(jax.random.fold_in(rng, segment_index + 1), slot_index),
+                jax.tree.map(lambda value: value[:, slot_index], observation),
+                actions[:, slot_index],
+                robottt=(state, masks["inner"][:, slot_index], position),
+                prefix=(
+                    None
+                    if prefixes is None
+                    else jax.tree.map(
+                        lambda value: (
+                            value
+                            if not hasattr(value, "ndim") or value.ndim <= 1
+                            else value[:, slot_index]
+                        ),
+                        prefixes,
+                    )
+                ),
+            )
+            target = masks["outer"][:, slot_index, None]
+            numerator += jnp.sum(loss * target)
+            count += jnp.sum(target) * self.action_horizon
+            position += masks["valid"][:, slot_index].astype(jnp.int32)
+            return (state, position, numerator, count), None
+
+        initial = (state, position, jnp.float32(0), jnp.int32(0))
+        (state, position, numerator, count), _ = jax.lax.scan(block, initial, jnp.arange(slot_count))
+        return numerator, count, jax.tree.map(jax.lax.stop_gradient, state), position
+
+    def prefill_robottt(self, rng, segment_index, observation, actions, masks, state, position):
+        return self.compute_robottt_segment_loss(
+            rng, segment_index, observation, actions, masks, state, position, train=False)
 
     @override
     def sample_actions(
@@ -645,6 +735,8 @@ class HistoryPi0(BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        fast_state=None,
+        block_position=None,
     ) -> Actions:
 
         observation = preprocess_observation(None, observation, train=False)
@@ -691,13 +783,14 @@ class HistoryPi0(BaseModel):
             else:
                 prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
             positions = jnp.cumsum(prefix_mask, axis=1) - 1
-            _, kv_cache = self.PaliGemma.llm(
-                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+            llm_result = self.PaliGemma.llm(
+                [prefix_tokens, None], mask=prefix_attn_mask, positions=positions,
+                robottt=(fast_state, None, None) if self.use_robottt else None,
             )
-            
+            kv_cache = llm_result[1]
 
         def step(carry):
-            x_t, time = carry
+            x_t, time = carry[:2]
             suffix_tokens, suffix_mask, suffix_ar_mask, _, adarms_cond = (
                 self.embed_suffix(observation, x_t, jnp.broadcast_to(time, batch_size))
             )
@@ -746,18 +839,36 @@ class HistoryPi0(BaseModel):
                     mem_mask=[None, mem_mask],
                 )
             else:
-                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                llm_result = self.PaliGemma.llm(
                     [None, suffix_tokens],
                     mask=full_attn_mask,
                     positions=positions,
                     kv_cache=kv_cache,
                     adarms_cond=[None, adarms_cond],
+                    robottt=(fast_state, jnp.ones(suffix_mask.shape, dtype=jnp.bool_), block_position)
+                    if self.use_robottt else None,
                 )
+                prefix_out, suffix_out = llm_result[0]
+                candidate_state = llm_result[2] if self.use_robottt else None
 
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            action_out = (
+                suffix_out[:, : self.action_horizon]
+                if self.use_robottt else suffix_out[:, -self.action_horizon :]
+            )
+            v_t = self.action_out_proj(action_out)
 
+            if self.use_robottt:
+                return x_t + dt * v_t, time + dt, candidate_state
             return x_t + dt * v_t, time + dt
+
+        if self.use_robottt:
+            def robottt_step(step_index, carry):
+                time = 1.0 - step_index / num_steps
+                return step((carry[0], time))
+
+            x_0, _, candidate_state = jax.lax.fori_loop(0, num_steps, robottt_step, (noise, 1.0, fast_state))
+            return x_0, candidate_state
 
         def cond(carry):
             x_t, time = carry

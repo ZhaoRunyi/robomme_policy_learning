@@ -1,6 +1,9 @@
 import os
+import bisect
 import json
 import logging
+import h5py
+import jax
 import numpy as np
 from omegaconf import DictConfig
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,6 +13,7 @@ import re
 
 from openpi.training import config as _config
 from openpi.training.data_loader import Dataset
+from openpi import transforms as _transforms
 from mme_vla_suite.shared.mem_buffer import MemoryBuffer, MemoryBufferRecurrent
 import pickle
 
@@ -274,3 +278,89 @@ class RoboMMEDataset(Dataset):
                 data[key] = None        
 
         return data
+
+
+class RoboTTTSequenceDataset(Dataset):
+    def __init__(self, manifest_path, data_config, temporal_blocks, segment_length):
+        manifest = json.load(open(manifest_path))
+        if manifest["max_phase_aligned_blocks"] > 96:
+            raise ValueError("RoboTTT manifest exceeds the approved T96 horizon")
+        self.episodes = manifest["episodes"]
+        self.ends = [episode["cumulative_execution_count"] for episode in self.episodes]
+        self.temporal_blocks = temporal_blocks
+        self.segment_length = 1 if temporal_blocks == 1 else segment_length
+        self.files = {}
+        model_transforms = data_config.model_transforms.inputs
+        self.transform = _transforms.compose(
+            [*data_config.data_transforms.inputs,
+             _transforms.Normalize(data_config.norm_stats, use_quantiles=data_config.use_quantile_norm),
+             *model_transforms[:2], *model_transforms[3:]]
+        )
+        self.tokenize = model_transforms[2]
+
+    def __len__(self):
+        return self.ends[-1]
+
+    def __getitem__(self, index):
+        episode_index = bisect.bisect_right(self.ends, index)
+        episode = self.episodes[episode_index]
+        previous_end = self.ends[episode_index - 1] if episode_index else 0
+        anchor = episode["exec_start_idx"] + index - previous_end
+        start = max(anchor - 16 * (self.temporal_blocks - 1), anchor % 16)
+        block_indices = np.arange(start, anchor + 1, 16, dtype=np.int32)
+        is_video = block_indices < episode["exec_start_idx"]
+
+        path = episode["h5_path"]
+        if path not in self.files:
+            self.files[path] = h5py.File(path, "r")
+        episode_group = self.files[path][episode["episode_group"]]
+        tokenized = self.tokenize({
+            "prompt": episode["task_goal"], "state": np.zeros(8),
+            "simple_subgoal": None, "grounded_subgoal": None,
+        })
+
+        blocks = []
+        for block_index, video in zip(block_indices, is_video):
+            timestep = episode_group[f"timestep_{block_index}"]
+            action_indices = np.minimum(block_index + np.arange(20), episode["num_steps"] - 1)
+            sample = {
+                "observation/image": timestep["obs/front_rgb"][()],
+                "observation/wrist_image": timestep["obs/wrist_rgb"][()],
+                "observation/state": np.concatenate(
+                    [timestep["obs/joint_state"][()], timestep["obs/gripper_state"][()][:1]]
+                ).astype(np.float32),
+                "actions": np.stack([
+                    episode_group[f"timestep_{step}"]["action/joint_action"][()]
+                    for step in action_indices
+                ]).astype(np.float32),
+                "prompt": episode["task_goal"],
+            }
+            block = self.transform(sample)
+            block = {key: value for key, value in block.items() if value is not None}
+            block.pop("prompt", None)
+            block.update({key: tokenized[key] for key in ("tokenized_prompt", "tokenized_prompt_mask")})
+            if video:
+                block["actions"][:] = 0
+            blocks.append(block)
+        sequence = jax.tree.map(lambda *values: np.stack(values), *blocks)
+
+        segment_length = self.segment_length
+        first_execution = int(np.sum(is_video))
+        left_padding = (segment_length - 1 - first_execution) % segment_length
+        target_segments = 1 + (self.temporal_blocks - 1 + segment_length - 1) // segment_length
+        right_padding = target_segments * segment_length - left_padding - len(block_indices)
+        padding = (left_padding, right_padding)
+        packed = jax.tree.map(
+            lambda value: np.pad(value, [padding] + [(0, 0)] * (value.ndim - 1)),
+            sequence,
+        )
+        valid = np.pad(np.ones(len(block_indices), dtype=np.bool_), padding)
+        video_mask = np.pad(is_video, padding)
+        inner_mask = np.repeat(valid[..., None], 36, axis=-1)
+        inner_mask[video_mask, :20] = False
+        packed["robottt"] = {
+            "valid": valid,
+            "inner": inner_mask,
+            "outer": valid & ~video_mask,
+        }
+        return packed

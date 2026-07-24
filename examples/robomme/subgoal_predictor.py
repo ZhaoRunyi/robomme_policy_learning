@@ -6,17 +6,6 @@ import shutil
 from env_runner import EnvRunner
 from utils import EpisodeState, SUBGOAL_TYPES, TASK_WITH_VIDEO_DEMO
 
-from subgoal_prediction.gemini.api import GeminiModel
-from subgoal_prediction.gemini.prompts import (
-    DEMO_TEXT_QUERY,
-    IMAGE_TEXT_QUERY,
-    VIDEO_TEXT_QUERY,
-)
-
-from subgoal_prediction.qwenvl.api import Qwen3VLModel
-from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
-
-
 LONG_FIRST_ACTION_TASKS = [
     "BinFill",
     "PickXtimes",
@@ -85,6 +74,8 @@ class NullSubgoalPredictor(SubgoalPredictorBase):
 
 class GeminiSubgoalPredictor(SubgoalPredictorBase):
     def start_episode(self, epstate: EpisodeState, env_runner: EnvRunner) -> None:
+        from subgoal_prediction.gemini.api import GeminiModel
+
         super().start_episode(epstate, env_runner)
         self.api = GeminiModel(
             save_dir=os.path.join(self.save_dir, self.env_name, f"ep{self.episode_id}"),
@@ -135,6 +126,8 @@ class GeminiSubgoalPredictor(SubgoalPredictorBase):
         del self.api
 
     def _get_text_query(self, count: int) -> str:
+        from subgoal_prediction.gemini.prompts import DEMO_TEXT_QUERY, IMAGE_TEXT_QUERY, VIDEO_TEXT_QUERY
+
         if count == 0:
             if self.env_name in TASK_WITH_VIDEO_DEMO:
                 template = DEMO_TEXT_QUERY
@@ -155,6 +148,8 @@ class GeminiSubgoalPredictor(SubgoalPredictorBase):
 class QwenVLSubgoalPredictor(SubgoalPredictorBase):
     
     def setup_api(self) -> None:
+        from subgoal_prediction.qwenvl.api import Qwen3VLModel
+
         self.api = Qwen3VLModel(
             adapter_path=self.args.qwenvl_simpleSG_adapter_path if self.args.subgoal_type == "simple_subgoal" else self.args.qwenvl_groundSG_adapter_path,
             subgoal_type=self.args.subgoal_type,
@@ -200,6 +195,8 @@ class QwenVLSubgoalPredictor(SubgoalPredictorBase):
 
 class MemERSubgoalPredictor(SubgoalPredictorBase):
     def setup_api(self) -> None:
+        from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
+
         self.api = Qwen3VLModelMemER(adapter_path=self.args.memer_adapter_path)
         print("[robomme] MemER agent setup finished")
     
@@ -256,6 +253,5 @@ def build_subgoal_predictor(
         return OracleSubgoalPredictor(args, save_dir)
     
     return NullSubgoalPredictor(args, save_dir)
-
 
 

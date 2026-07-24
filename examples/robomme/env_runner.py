@@ -82,6 +82,8 @@ class EnvRunner:
         except Exception as e:
             print(f"Error: {e}")
             return (None, None, None), True, "error"
+        if self.info.get("status") == "error":
+            return (None, None, None), True, "error"
 
         img = obs["front_rgb_list"][-1]
         wrist_img = obs["wrist_rgb_list"][-1]

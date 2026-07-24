@@ -13,6 +13,7 @@ from openpi.shared import nnx_utils
 
 from mme_vla_suite.models.integration.history_observation import HistAugObservation
 from mme_vla_suite.models.integration.history_pi0 import HistoryPi0
+from mme_vla_suite.models.representation.robottt import create_fast_state
 from mme_vla_suite.shared.mem_buffer import MemoryBuffer, MemoryBufferRecurrent
 
 class MME_VLA_Policy:
@@ -40,6 +41,8 @@ class MME_VLA_Policy:
         
         
         self.config = model.history_config
+        self._uses_robottt = model.use_robottt
+        self._robottt_prefill = nnx_utils.module_jit(model.prefill_robottt)
         self.mem_buffer = None
         
         self.state_norm_stats = norm_stats['state']
@@ -49,7 +52,7 @@ class MME_VLA_Policy:
         
     
     def _prepare_mem_buffer(self):
-        if self.config is None or self.config.representation_type == "symbolic":
+        if self._uses_robottt or self.config is None or self.config.representation_type == "symbolic":
             self.mem_buffer = None
         elif self.config.representation_type == "recurrent":
             self.mem_buffer = MemoryBufferRecurrent(
@@ -73,42 +76,85 @@ class MME_VLA_Policy:
                 prepare_buffer=True, vision_enc_fn=self._vision_encode,
             )
 
+    def _prepare_observation(self, inputs: dict, include_history: bool = False):
+        inputs = self._prepare_history(inputs) if include_history else inputs
+        return HistAugObservation.from_dict(jax.tree.map(
+            lambda value: jnp.asarray(value)[None], self._input_transform(inputs)))
+
     @override
     def infer(self, obs: dict) -> dict:
-        if self.config is not None and self.config.representation_type != "symbolic":
+        if not self._uses_robottt and self.config is not None and self.config.representation_type != "symbolic":
             assert len(self.mem_buffer._history_feats) > 0, \
                 "history feats is empty, add buffer first"
                                         
-        inputs = jax.tree.map(lambda x: x, obs)
-        inputs = self._prepare_history(inputs)
-        inputs = self._input_transform(inputs)
-        observation = HistAugObservation.from_dict(
-            jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-        )
+        observation = self._prepare_observation(obs, include_history=not self._uses_robottt)
         self._rng, sample_rng = jax.random.split(self._rng)
     
         start_time = time.monotonic()
-        outputs = {
-            "state": observation.state,
-            "actions": self._sample_actions(sample_rng, observation, **self._sample_kwargs),
-        }
+        actions = self._sample_actions(
+            sample_rng, observation,
+            fast_state=self._episode_fast_state if self._uses_robottt else None,
+            block_position=jnp.asarray([self.step_idx]) if self._uses_robottt else None,
+            **self._sample_kwargs,
+        )
+        if self._uses_robottt:
+            actions, candidate_state = actions
+            if self._robottt_mode != "no_carry":
+                self._episode_fast_state = candidate_state
+            self.step_idx += 1
+        outputs = {"state": observation.state, "actions": actions}
         model_time = time.monotonic() - start_time
         outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)      
         outputs = self._output_transform(outputs)
         outputs["infer_time_ms"] = model_time * 1000
-        
         return outputs
     
     @override
-    def reset(self) -> None:
+    def reset(self, robottt_mode: str = "normal") -> None:
         del self.mem_buffer
         self._prepare_mem_buffer()
-        self.step_idx = -1  
+        self.step_idx = 0 if self._uses_robottt else -1
         self.exec_start_idx = 0
         self._rng = jax.random.key(self._seed)
+        if self._uses_robottt:
+            self._robottt_mode = robottt_mode
+            self._episode_fast_state = create_fast_state(1)
             
     
     def add_buffer(self, obs: dict) -> None:
+        if self._uses_robottt:
+            if self.step_idx:
+                return
+            indices = np.arange(obs["exec_start_idx"] % 16, obs["exec_start_idx"], 16)
+            self.step_idx = len(indices)
+            if self._robottt_mode == "no_video":
+                return
+            segment_length = self.config.recurrent_memory.tbptt_segment_length
+            observations = [self._prepare_observation({
+                "observation/image": obs["images"][index, 0],
+                "observation/wrist_image": obs["wrist_images"][index, 0],
+                "observation/state": obs["state"][index],
+                "prompt": obs["prompt"],
+            }) for index in indices]
+            if not observations:
+                return
+            valid_blocks = len(observations)
+            observations += [jax.tree.map(jnp.zeros_like, observations[0])] * (-valid_blocks % segment_length)
+            observations = jax.tree.map(lambda *values: jnp.stack(values, axis=1), *observations)
+            for segment_index, start in enumerate(range(0, len(indices), segment_length)):
+                observation = jax.tree.map(lambda value: value[:, start:start + segment_length], observations)
+                valid_count = min(segment_length, valid_blocks - start)
+                valid = jnp.arange(segment_length)[None] < valid_count
+                masks = {
+                    "valid": valid,
+                    "inner": valid[:, :, None] & (jnp.arange(36)[None, None] >= 20),
+                    "outer": jnp.zeros_like(valid),
+                }
+                _, _, self._episode_fast_state, _ = self._robottt_prefill(
+                    self._rng, segment_index, observation,
+                    jnp.zeros((1, segment_length, 20, self._model.action_dim)), masks,
+                    self._episode_fast_state, jnp.asarray([start], jnp.int32))
+            return
         if self.mem_buffer is None:
             return
         images = obs["images"]

@@ -42,6 +42,8 @@ class Args:
     policy_name: str = "dummy_test"
     model_seed: int = 42
     model_ckpt_id: int = 80000
+    robottt_mode: Optional[str] = None
+    episodes_per_task: Optional[int] = None
 
     # task control
     re_eval_tasks: str = "" # tasks split by comma
@@ -75,15 +77,21 @@ class EpisodeEvaluator:
         subgoal_predictor: SubgoalPredictorBase,
         video_save_dir: Path,
     ) -> str:
-        client = _websocket_client_policy.MMEVLAWebsocketClientPolicy(
+        self.client = _websocket_client_policy.MMEVLAWebsocketClientPolicy(
             self.args.host, self.args.port
         )
-        resp = client.reset()
+        client = self.client
+        resp = client.reset(self.args.robottt_mode)
         while not resp.get("reset_finished", False):
             time.sleep(0.1)
 
         epstate = EpisodeState()
         task_goal, recorder = self.init_episode(env_runner, epstate, video_save_dir)
+        video_blocks = len(range(epstate.exec_start_idx % 16, epstate.exec_start_idx, 16))
+        self.episode_metrics = {
+            "reset_time_ms": resp.get("reset_time_ms", 0), "video_blocks_seen": video_blocks,
+            "prefill_time_ms": 0, "infer_time_ms": [],
+        }
         subgoal_predictor.start_episode(epstate, env_runner)        
 
         img, wrist_img, robot_state = epstate.get_current_obs()
@@ -110,7 +118,7 @@ class EpisodeEvaluator:
                     break
 
                 action_chunk = self.get_action_chunk(
-                    client, epstate, img, wrist_img, robot_state, prompt, subgoal, 
+                    client, epstate, img, wrist_img, robot_state, prompt, subgoal,
                     exec_horizon=self.args.obs_horizon
                 )
 
@@ -121,6 +129,8 @@ class EpisodeEvaluator:
 
             action = epstate.action_plan.popleft()
             obs, stop_flag, success_flag = env_runner.step(action)
+            if stop_flag and success_flag == "error":
+                raise RuntimeError(f"{env_runner.info.get('exception_type')}: {env_runner.info.get('error_message')}")
             epstate.count += 1
 
             if epstate.count > self.args.max_steps:
@@ -142,13 +152,33 @@ class EpisodeEvaluator:
                 break
 
         if success_flag == "unknown":
+            self.finish_metrics(epstate)
+            client.close()
             return "unknown"
 
         video_filename = f"{env_runner.env_id}_ep{env_runner.episode_id}_{success_flag}_{task_goal}_{env_runner.difficulty}.mp4"
         recorder.save_video(video_filename)
 
         subgoal_predictor.end_episode(epstate, success_flag)
+        self.finish_metrics(epstate)
+        client.close()
         return success_flag
+
+    def finish_metrics(self, state):
+        metrics = self.episode_metrics
+        mode = self.args.robottt_mode or "normal"
+        updated_video = 0 if mode == "no_video" else metrics["video_blocks_seen"]
+        decisions = len(metrics["infer_time_ms"])
+        total_blocks = metrics["video_blocks_seen"] + decisions
+        metrics.update(
+            raw_env_steps=state.count,
+            policy_decisions=decisions,
+            video_blocks_updated=updated_video,
+            execution_blocks=decisions,
+            inner_valid_tokens=16 * updated_video + 36 * decisions,
+            first_extrapolated_block=96 if total_blocks > 96 else None,
+            extrapolated_blocks=max(total_blocks - 96, 0),
+        )
 
 
     def init_episode(
@@ -193,13 +223,17 @@ class EpisodeEvaluator:
         exec_horizon: int,
     ) -> list:
         if self.args.use_history:
-            resp = client.add_buffer(pack_buffer(
+            buffer = pack_buffer(
                 state.image_buffer,
                 state.state_buffer,
                 state.exec_start_idx,
-            ))
+            )
+            buffer.update(wrist_images=np.stack(state.wrist_image_buffer).astype(np.uint8)[:, None], prompt=prompt)
+            resp = client.add_buffer(buffer)
             while not resp.get("add_buffer_finished", False):
                 time.sleep(0.1)
+            if not self.episode_metrics["infer_time_ms"]:
+                self.episode_metrics["prefill_time_ms"] = resp.get("add_buffer_time_ms", 0)
 
         element = {
             "observation/image": img,
@@ -212,7 +246,9 @@ class EpisodeEvaluator:
             element['simple_subgoal'] = subgoal
             element['grounded_subgoal'] = subgoal
 
-        action_chunk = client.infer(element)["actions"]
+        response = client.infer(element)
+        self.episode_metrics["infer_time_ms"].append(response.get("infer_time_ms", 0))
+        action_chunk = response["actions"]
         return action_chunk[:exec_horizon]
 
 
@@ -234,6 +270,8 @@ def setup_save_directory(args: Args) -> Path:
             save_dir = save_dir / "memer"
         else:
             save_dir = save_dir / "oracle"
+    if args.robottt_mode is not None:
+        save_dir = save_dir / args.robottt_mode
 
     if save_dir.exists():
         if args.overwrite:
@@ -254,15 +292,15 @@ def setup_log_dict(save_dir: Path, args: Args) -> dict:
     elif os.path.exists(save_dir / "log.json"):
         with open(save_dir / "log.json", "r") as f:
             log_dict = json.load(f)
-        log_dict.pop("success_rate", None)
-        log_dict.pop("total_success_rate", None)
+        for key in ("success_rate", "total_success_rate", "episode_details", "wilson_95", "total_wilson_95"):
+            log_dict.pop(key, None)
     else:
         log_dict = {}
 
     for task_name in log_dict:
         error_list = []
         for k, v in log_dict[task_name].items():
-            if v == "error":
+            if v == "error" and args.robottt_mode is None:
                 error_list.append(k)
         for k in error_list:
             log_dict[task_name].pop(k)
@@ -282,11 +320,17 @@ def setup_log_dict(save_dir: Path, args: Args) -> dict:
 def evaluate(args: Args):
     """Main evaluation function."""
     check_args(args)
+    if args.robottt_mode not in (None, "normal", "no_video", "no_carry"):
+        raise ValueError(f"Unsupported RoboTTT mode: {args.robottt_mode}")
 
     save_dir = setup_save_directory(args)
     video_save_dir = save_dir / "videos"
 
     log_dict = setup_log_dict(save_dir, args)
+    details_path = save_dir / "details.json"
+    details = json.load(open(details_path)) if details_path.exists() else {}
+    if args.robottt_mode is not None and (save_dir / "log.json").exists():
+        (save_dir / "log.json").unlink()
 
     if args.only_tasks:
         task_names = args.only_tasks.split(",")
@@ -307,7 +351,7 @@ def evaluate(args: Args):
                 log_dict[task_name] = {}
 
             env_runner = EnvRunner(task_name, video_save_dir, max_steps=args.max_steps)
-            num_episodes = env_runner.num_episodes
+            num_episodes = min(env_runner.num_episodes, args.episodes_per_task or env_runner.num_episodes)
 
             success_flag = "unknown"
 
@@ -322,18 +366,27 @@ def evaluate(args: Args):
                 try:
                     success_flag = evaluator.eval_each_episode(env_runner, subgoal_predictor, video_save_dir)
                     if success_flag == "unknown":
-                        log_dict[task_name][episode_id] = "error"
+                        log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
+                        evaluator.episode_metrics["error"] = "unknown policy response"
                     else:
                         log_dict[task_name][episode_id] = success_flag == "success"
+                    if args.robottt_mode is not None:
+                        details[f"{task_name}/{episode_id}"] = evaluator.episode_metrics
                 except Exception as e:
                     print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
-                    log_dict[task_name][episode_id] = "error"
+                    log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
+                    details[f"{task_name}/{episode_id}"] = {"error": str(e)}
+                    if hasattr(evaluator, "client"):
+                        evaluator.client.close()
 
                 env_runner.close_env()
                 with open(save_dir / "progress.json", "w") as f:
                     json.dump(log_dict, f, indent=2)
+                if args.robottt_mode is not None:
+                    with open(details_path, "w") as f:
+                        json.dump(details, f, indent=2)
 
-                if success_flag == "unknown":
+                if success_flag == "unknown" and args.robottt_mode is None:
                     print("API calling error, aborting...")
                     return
 
@@ -341,6 +394,12 @@ def evaluate(args: Args):
             time.sleep(1)
 
         try:
+            def wilson(successes, count):
+                probability = successes / count
+                center = (probability + 1.96**2 / (2 * count)) / (1 + 1.96**2 / count)
+                margin = 1.96 * np.sqrt(probability * (1 - probability) / count + 1.96**2 / (4 * count**2)) / (1 + 1.96**2 / count)
+                return [center - margin, center + margin]
+
             final_results = {}
             final_results["success_rate"] = {
                 task_name: sum(log_dict[task_name].values()) / len(log_dict[task_name].values())
@@ -349,6 +408,12 @@ def evaluate(args: Args):
             final_results["total_success_rate"] = (
                 sum(final_results["success_rate"].values()) / len(final_results["success_rate"].values())
             )
+            if args.robottt_mode is not None:
+                final_results["episode_details"] = details
+                final_results["wilson_95"] = {
+                    task_name: wilson(sum(values.values()), len(values)) for task_name, values in log_dict.items()}
+                all_results = [value for values in log_dict.values() for value in values.values()]
+                final_results["total_wilson_95"] = wilson(sum(all_results), len(all_results))
             with open(save_dir / "log.json", "w") as f:
                 json.dump(final_results, f, indent=2)
         except Exception as e:

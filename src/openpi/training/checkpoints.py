@@ -18,11 +18,14 @@ import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool,
+    full_state: bool = False, read_only: bool = False,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
-    if checkpoint_dir.exists():
+    if read_only and not checkpoint_dir.exists():
+        raise FileNotFoundError(checkpoint_dir)
+    if checkpoint_dir.exists() and not read_only:
         if overwrite:
             checkpoint_dir.rmtree()
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -35,19 +38,22 @@ def initialize_checkpoint_dir(
                 "to indicate how to handle it."
             )
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if not read_only:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    handlers = {"assets": CallbackHandler(), "params": ocp.PyTreeCheckpointHandler()}
+    if full_state:
+        handlers["train_state"] = ocp.PyTreeCheckpointHandler()
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
-        item_handlers={
-            "assets": CallbackHandler(),
-            # "train_state": ocp.PyTreeCheckpointHandler(),
-            "params": ocp.PyTreeCheckpointHandler(),
-        },
+        item_handlers=handlers,
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
-            keep_period=keep_period,
+            keep_period=None if full_state else keep_period,
+            should_keep_fn=(lambda step: 50_000 <= step <= 100_000 and step % 10_000 == 0)
+            if full_state and not read_only else None,
             create=False,
+            read_only=read_only,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )
@@ -67,6 +73,7 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    full_state: bool = False,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -78,11 +85,9 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
-    items = {
-        "assets": save_assets,
-        # "train_state": train_state,
-        "params": {"params": params},
-    }
+    items = {"assets": save_assets, "params": {"params": params}}
+    if full_state:
+        items["train_state"] = train_state
     checkpoint_manager.save(step, items)
 
 
@@ -91,19 +96,19 @@ def restore_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
+    full_state: bool = False,
 ) -> training_utils.TrainState:
     del data_loader
 
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        restored = checkpoint_manager.restore(
-            step,
-            items={
-                # "train_state": train_state,
-                "params": {"params": params},
-            },
-        )
+        items = {"params": {"params": params}}
+        if full_state:
+            items["train_state"] = train_state
+        restored = checkpoint_manager.restore(step, items=items)
+    if not full_state:
+        return dataclasses.replace(state, params=restored["params"]["params"])
     return _merge_params(restored["train_state"], restored["params"])
 
 

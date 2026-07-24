@@ -20,6 +20,7 @@ import openpi.training.sharding as sharding
 
 
 from mme_vla_suite.models.representation.utils import kernel_init_out_proj
+from mme_vla_suite.models.representation.robottt import RoboTTTLayer, create_fast_state
 from mme_vla_suite.models.integration.utils import _name
 from mme_vla_suite.models.integration.utils import Attention_with_MemoryExpert
 from mme_vla_suite.models.integration.utils import get_config, Variant
@@ -118,7 +119,6 @@ class HistoryBlock(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     integration_type: str | None = None
-
     @nn.compact
     def __call__(
         self,
@@ -129,6 +129,7 @@ class HistoryBlock(nn.Module):
         adarms_cond,
         mem_seq,
         mem_mask,
+        robottt,
         deterministic=True,
     ):  # noqa: FBT002
 
@@ -167,7 +168,13 @@ class HistoryBlock(nn.Module):
             for x, y, gate in zip(xs, post_attn, gates, strict=True)
         ]
         xs = sharding.activation_sharding_constraint(xs)
-        
+
+        robottt_fast_state, robottt_inner_mask, robottt_block_position = robottt
+        if self.integration_type == "layer" and xs[-1] is not None:
+            xs[-1], robottt_fast_state = RoboTTTLayer(name="robottt")(
+                xs[-1], robottt_fast_state, robottt_inner_mask, robottt_block_position
+            )
+            robottt_fast_state = sharding.activation_sharding_constraint(robottt_fast_state)
 
         out = []
         gates = []
@@ -202,7 +209,7 @@ class HistoryBlock(nn.Module):
         ]
         xs = sharding.activation_sharding_constraint(xs)
         
-        return xs, kv_cache
+        return xs, (kv_cache, robottt_fast_state)
 
 
 KVCache: TypeAlias = tuple[
@@ -222,7 +229,6 @@ class Module(nn.Module):
     adarms: bool = False
     
     integration_type: str | None = None
-
     def setup(self):
         # all experts must have the same depth
         assert all(config.depth == self.configs[0].depth for config in self.configs)
@@ -235,7 +241,7 @@ class Module(nn.Module):
         block_cls = nn.remat(
             HistoryBlock,
             prevent_cse=False,
-            static_argnums=(7,),  # 0=xs, 5=decode
+            static_argnums=(8,),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
         self.layers = nn.scan(
@@ -249,8 +255,9 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
+                (0, nn.broadcast, nn.broadcast),
                 nn.broadcast,
-            ),  # 0=kv_cache, 1=positions, 2=mask, 3=adarms_cond, 4=mem_seq, 5=mem_mask, 6=deterministic
+            ),
             length=self.configs[0].depth,
         )(
             configs=self.configs,
@@ -278,14 +285,17 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
+        robottt=None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+    ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
+        if robottt is None:
+            robottt = (None, None, None)
 
-        embedded, kv_cache = self.layers(
+        embedded, (kv_cache, robottt_fast_state) = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -293,6 +303,7 @@ class Module(nn.Module):
             adarms_cond,
             mem_seq,
             mem_mask,
+            robottt,
             deterministic,
         )
 
@@ -300,10 +311,11 @@ class Module(nn.Module):
             e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None
         )
 
-        return [
+        outputs = [
             f(e, a)[0] if e is not None else e
             for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        return (outputs, kv_cache, robottt_fast_state) if self.integration_type == "layer" else (outputs, kv_cache)
 
     def init(self, use_adarms: Sequence[bool], mem_mods: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
@@ -321,4 +333,7 @@ class Module(nn.Module):
                 for c, m in zip(self.configs, mem_mods, strict=True)
             ],
             mem_mask=[jnp.ones((1, 4), dtype=bool) if m else None for m in mem_mods],
+            robottt=(
+                create_fast_state(1), jnp.ones((1, 1), dtype=bool), jnp.zeros((1,), dtype=jnp.int32)
+            ) if self.integration_type == "layer" else None,
         )
