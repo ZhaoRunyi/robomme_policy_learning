@@ -530,6 +530,8 @@ class TrainConfig:
     resume_step: int | None = None
     
     dataset_path: str = "data/robomme"
+    train_robottt_only: bool = False
+    robottt_stage_steps: int | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -551,6 +553,9 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.train_robottt_only:
+            object.__setattr__(self, "freeze_filter", nnx.Not(nnx.Any(
+                nnx.PathContains("robottt"), nnx.PathContains("robottt_register_tokens"))))
 
 
 OPENPI_DATA_HOME = os.getenv("OPENPI_DATA_HOME", "~/.cache/openpi")
@@ -620,25 +625,46 @@ _CONFIGS = [
         ema_decay=0.999,
         fsdp_devices=4,
     ),
+    TrainConfig(
+        name="robomme_pi05_robottt",
+        model=history_pi0.HistoryPi0Config(
+            pi05=True,
+            action_horizon=20,
+            use_history=True,
+            history_config="recurrent-robottt-layer.yaml",
+            discrete_state_input=False,
+        ),
+        data=RoboMMEDataConfig(
+            repo_id="robomme",
+            assets=AssetsConfig(
+                assets_dir="/workspace/ttt_ws/robomme_policy_learning/assets",
+                asset_id=".",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-5),
+        freeze_filter=nnx.Nothing(),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/ttt_ws/ckpts/pi05_base/params"
+        ),
+        num_train_steps=100_000,
+        save_interval=10_000,
+        keep_period=10_000,
+        num_workers=4,
+        ema_decay=0.999,
+        fsdp_devices=8,
+        dataset_path="/workspace/ttt_ws/data/manifests/robottt_manifest.json",
+        assets_base_dir="/workspace/ttt_ws/runs/robottt/assets",
+        checkpoint_base_dir="/workspace/ttt_ws/runs/robottt/ckpts",
+    ),
 ]
-
-_robomme_base = next(config for config in _CONFIGS if config.name == "mme_vla_suite")
-_CONFIGS.append(dataclasses.replace(
-    _robomme_base,
-    name="robomme_pi05_robottt",
-    model=dataclasses.replace(_robomme_base.model, history_config="recurrent-robottt-layer.yaml"),
-    data=dataclasses.replace(
-        _robomme_base.data,
-        assets=AssetsConfig(assets_dir="/workspace/ttt_ws/robomme_policy_learning/assets", asset_id=".")),
-    optimizer=_optimizer.AdamW(weight_decay=1e-5),
-    freeze_filter=nnx.Nothing(),
-    weight_loader=weight_loaders.CheckpointWeightLoader("/workspace/ttt_ws/ckpts/pi05_base/params"),
-    num_train_steps=100_000,
-    fsdp_devices=8,
-    dataset_path="/workspace/ttt_ws/cache/dataset_manifest/robottt_manifest.json",
-    assets_base_dir="/workspace/ttt_ws/runs/robottt/assets",
-    checkpoint_base_dir="/workspace/ttt_ws/runs/robottt/ckpts",
-))
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

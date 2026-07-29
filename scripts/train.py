@@ -507,9 +507,10 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
+    cache_home = epath.Path(os.getenv("XDG_CACHE_HOME", "~/.cache")).expanduser()
     jax.config.update(
         "jax_compilation_cache_dir",
-        str(epath.Path(f"~/.cache/jax_{config.exp_name}").expanduser()),
+        str(cache_home / f"jax_{config.exp_name}"),
     )
 
     rng = jax.random.key(config.seed)
@@ -568,6 +569,9 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     logging.info(f"data_config: {data_config}")
 
     curriculum = ((0, 1), (50_000, 4), (60_000, 8), (70_000, 32), (80_000, 64), (90_000, 96))
+    if config.robottt_stage_steps is not None:
+        curriculum = tuple((index * config.robottt_stage_steps, blocks)
+                           for index, blocks in enumerate((1, 4, 8, 32, 64, 96)))
     stage_at = lambda step: next(stage for stage in reversed(curriculum) if step >= stage[0])
 
     make_loader = functools.partial(
