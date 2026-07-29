@@ -635,7 +635,7 @@ _CONFIGS.append(dataclasses.replace(
     weight_loader=weight_loaders.CheckpointWeightLoader("/workspace/ttt_ws/ckpts/pi05_base/params"),
     num_train_steps=100_000,
     fsdp_devices=8,
-    dataset_path="/workspace/ttt_ws/cache/dataset_manifest/robottt_manifest.json",
+    dataset_path="/workspace/ttt_ws/data/manifests/robottt_manifest.json",
     assets_base_dir="/workspace/ttt_ws/runs/robottt/assets",
     checkpoint_base_dir="/workspace/ttt_ws/runs/robottt/ckpts",
 ))
