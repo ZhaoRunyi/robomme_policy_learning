@@ -52,6 +52,9 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
     seed: int = 42
+    parallel_clients: int = 1
+    inference_batch_size: int = 2
+    batch_wait_ms: float = 50
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -100,6 +103,9 @@ def main(args: Args) -> None:
         host="0.0.0.0",
         port=args.port,
         metadata=policy_metadata,
+        parallel_clients=args.parallel_clients,
+        inference_batch_size=args.inference_batch_size,
+        batch_wait_ms=args.batch_wait_ms,
     )
     server.serve_forever()
 

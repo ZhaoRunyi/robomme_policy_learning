@@ -2,7 +2,6 @@ import flax.linen as nn
 from flax import struct
 import jax
 import jax.numpy as jnp
-import os
 
 from openpi.models.gemma import _apply_rope
 import openpi.training.sharding as sharding
@@ -45,8 +44,8 @@ class RoboTTTLayer(nn.Module):
         query = nn.Dense(name="query", **dense)(hidden_fp32)
         key = nn.Dense(name="key", **dense)(hidden_fp32)
         value = nn.Dense(name="value", **dense)(hidden_fp32)
-        if os.environ.get("ROBOTTT_QKV_CONSTRAINT") == "1":
-            query, key, value = sharding.activation_sharding_constraint((query, key, value))
+        query, key, value = sharding.activation_sharding_constraint(
+            (query, key, value))
         positions = block_position[:, None] * hidden.shape[1] + jnp.arange(hidden.shape[1])[None]
         rope_shape = (*hidden.shape[:2], HEADS, WIDTH // HEADS)
         query = query.reshape(rope_shape)
@@ -57,13 +56,33 @@ class RoboTTTLayer(nn.Module):
             query, positions=positions, max_wavelength=10_000.0).reshape(hidden.shape)
         key = _apply_rope(
             key, positions=positions, max_wavelength=10_000.0).reshape(hidden.shape)
-        def inner_loss(w1, b1, w2, b2, sample_key, sample_value, mask):
-            prediction = fast_mlp(
-                sample_key[None], w1[None], b1[None], w2[None], b2[None])[0]
-            error = jnp.square(prediction - sample_value) * mask[:, None]
-            return jnp.sum(error) / jnp.maximum(jnp.sum(mask) * WIDTH, 1)
-        gradients = jax.vmap(jax.grad(inner_loss, argnums=(0, 1, 2, 3)))(
-            weight1, bias1, weight2, bias2, key, value, inner_mask.astype(jnp.float32)
+        preactivation = jnp.einsum("bnd,bdh->bnh", key, weight1) + bias1[:, None]
+        gelu_scale = jnp.sqrt(jnp.asarray(2.0 / jnp.pi, preactivation.dtype))
+        gelu_argument = gelu_scale * (
+            preactivation + 0.044715 * preactivation**3)
+        gelu_tanh = jnp.tanh(gelu_argument)
+        activation = preactivation * 0.5 * (1 + gelu_tanh)
+        prediction = jnp.einsum(
+            "bnh,bhd->bnd", activation, weight2) + bias2[:, None]
+        mask = inner_mask.astype(jnp.float32)
+        prediction_gradient = 2 * (prediction - value) * mask[:, :, None]
+        prediction_gradient /= jnp.maximum(
+            jnp.sum(mask, axis=-1) * WIDTH, 1)[:, None, None]
+        weight2_gradient = jnp.einsum(
+            "bnh,bnd->bhd", activation, prediction_gradient)
+        bias2_gradient = jnp.sum(prediction_gradient, axis=1)
+        activation_gradient = jnp.einsum(
+            "bnd,bhd->bnh", prediction_gradient, weight2)
+        gelu_gradient = 0.5 * (1 + gelu_tanh) + (
+            0.5 * preactivation * (1 - gelu_tanh**2) * gelu_scale
+            * (1 + 3 * 0.044715 * preactivation**2)
+        )
+        preactivation_gradient = activation_gradient * gelu_gradient
+        gradients = (
+            jnp.einsum("bnd,bnh->bdh", key, preactivation_gradient),
+            jnp.sum(preactivation_gradient, axis=1),
+            weight2_gradient,
+            bias2_gradient,
         )
         inner_learning_rate_raw = self.param(
             "inner_learning_rate_raw", zeros, (), jnp.float32

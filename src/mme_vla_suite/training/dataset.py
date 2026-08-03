@@ -319,8 +319,14 @@ class RoboTTTSequenceDataset(Dataset):
         })
 
         blocks = []
+        outer_mask = []
         for block_index, video in zip(block_indices, is_video):
             timestep = episode_group[f"timestep_{block_index}"]
+            action_source = (
+                bool(timestep["info/action_source"][()])
+                if "action_source" in timestep["info"]
+                else True
+            )
             action_indices = np.minimum(block_index + np.arange(20), episode["num_steps"] - 1)
             sample = {
                 "observation/image": timestep["obs/front_rgb"][()],
@@ -341,6 +347,7 @@ class RoboTTTSequenceDataset(Dataset):
             if video:
                 block["actions"][:] = 0
             blocks.append(block)
+            outer_mask.append(not video and action_source)
         sequence = jax.tree.map(lambda *values: np.stack(values), *blocks)
 
         right_padding = self.temporal_blocks - len(block_indices)
@@ -356,6 +363,6 @@ class RoboTTTSequenceDataset(Dataset):
         packed["robottt"] = {
             "valid": valid,
             "inner": inner_mask,
-            "outer": valid & ~video_mask,
+            "outer": np.pad(np.asarray(outer_mask, dtype=np.bool_), padding),
         }
         return packed

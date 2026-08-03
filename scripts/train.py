@@ -36,6 +36,18 @@ import mme_vla_suite.training.config as _config
 import mme_vla_suite.training.dataloader as _data_loader
 from mme_vla_suite.models.config.utils import get_history_config
 from mme_vla_suite.models.representation.robottt import create_fast_state
+from mme_vla_suite.training.robottt_fast import (
+    PACKED_SEGMENTS,
+    alias_frozen_ema,
+    collect_lane,
+    merge_packed,
+    pack_context,
+    packed_grad,
+    padding_plan,
+    prepare_lane,
+    regroup_lane,
+    strip_frozen_ema,
+)
 
 
 def init_logging():
@@ -135,6 +147,8 @@ def init_train_state(
     resume: bool,
 ) -> tuple[training_utils.TrainState, Any]:
     use_robottt = "robottt" in str(config.model.history_config)
+    if use_robottt and not config.train_robottt_only:
+        raise ValueError("The packed RoboTTT path requires --train-robottt-only")
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule)
     if use_robottt:
         path_text = lambda path: jax.tree_util.keystr(path).lower()
@@ -277,12 +291,17 @@ def apply_gradients(config, state, model, grads, loss, stats):
     )
 
     if state.ema_decay is not None:
+        ema_new_params = (
+            new_params.filter(config.trainable_filter)
+            if config.train_robottt_only
+            else new_params
+        )
         new_state = dataclasses.replace(
             new_state,
             ema_params=jax.tree.map(
                 lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new,
                 state.ema_params,
-                new_params,
+                ema_new_params,
             ),
         )
 
@@ -312,162 +331,11 @@ def apply_gradients(config, state, model, grads, loss, stats):
     return new_state, info, stats
 
 
-def robottt_segment_grad(config, rng, state, batch, fast_state, position, segment_index):
-    model = nnx.merge(state.model_def, state.params)
-    model.train()
-
-    def loss_fn(model):
-        numerator, count, next_state, next_position = model.compute_robottt_segment_loss(
-            rng, segment_index, *batch, fast_state, position)
-        return numerator, (count, next_state, next_position)
-
-    diff_state = nnx.DiffState(0, config.trainable_filter)
-    (numerator, (count, fast_state, position)), grads = nnx.value_and_grad(
-        loss_fn, argnums=diff_state, has_aux=True)(model)
-    return grads, numerator, count, fast_state, position
-
-
-def robottt_bundle_grad(config, rng, state, batch, fast_state, position, segment_indices):
-    model = nnx.merge(state.model_def, state.params)
-    model.train()
-
-    def loss_fn(model):
-        def run_segment(carry, inputs):
-            numerator, count, fast_state, position = carry
-            observation, actions, masks, segment_index = inputs
-            next_numerator, next_count, fast_state, position = model.compute_robottt_segment_loss(
-                rng, segment_index, observation, actions, masks, fast_state, position)
-            return (
-                numerator + next_numerator,
-                count + next_count,
-                fast_state,
-                position,
-            ), None
-
-        scan_batch = jax.tree.map(lambda value: jnp.swapaxes(value, 0, 1), batch)
-        initial = (jnp.float32(0), jnp.int32(0), fast_state, position)
-        result, _ = jax.lax.scan(run_segment, initial, (*scan_batch, segment_indices))
-        numerator, count, next_fast_state, next_position = result
-        return numerator, (count, next_fast_state, next_position)
-
-    diff_state = nnx.DiffState(0, config.trainable_filter)
-    (numerator, (count, fast_state, position)), grads = nnx.value_and_grad(
-        loss_fn, argnums=diff_state, has_aux=True)(model)
-    return grads, numerator, count, fast_state, position
-
-
-def robottt_stream_bundle_grad(
-    config, rng, state, batch, fast_state, position, segment_indices):
-    first_batch = jax.tree.map(lambda value: value[:, 0], batch)
-    accumulated = robottt_segment_grad(
-        config, rng, state, first_batch, fast_state, position, segment_indices[0])
-
-    def run_segment(carry, inputs):
-        gradient_sum, numerator_sum, count_sum, fast_state, position = carry
-        observation, actions, masks, segment_index = inputs
-        grads, numerator, count, fast_state, position = robottt_segment_grad(
-            config,
-            rng,
-            state,
-            (observation, actions, masks),
-            fast_state,
-            position,
-            segment_index,
-        )
-        return (
-            jax.tree.map(jnp.add, gradient_sum, grads),
-            numerator_sum + numerator,
-            count_sum + count,
-            fast_state,
-            position,
-        ), None
-
-    scan_batch = jax.tree.map(lambda value: jnp.swapaxes(value[:, 1:], 0, 1), batch)
-    accumulated, _ = jax.lax.scan(
-        run_segment,
-        accumulated,
-        (*scan_batch, segment_indices[1:]),
-    )
-    return accumulated
-
-
-def robottt_segment_forward(config, rng, state, batch, fast_state, position, segment_index):
-    model = nnx.merge(state.model_def, state.params)
-    model.train()
-    _, _, fast_state, position = model.compute_robottt_segment_loss(
-        rng, segment_index, *batch, fast_state, position)
-    return fast_state, position
-
-
-def robottt_bundle_forward(config, rng, state, batch, fast_state, position, segment_indices):
-    model = nnx.merge(state.model_def, state.params)
-    model.train()
-
-    def run_segment(carry, inputs):
-        fast_state, position = carry
-        observation, actions, masks, segment_index = inputs
-        _, _, fast_state, position = model.compute_robottt_segment_loss(
-            rng, segment_index, observation, actions, masks, fast_state, position)
-        return (fast_state, position), None
-
-    scan_batch = jax.tree.map(lambda value: jnp.swapaxes(value, 0, 1), batch)
-    (fast_state, position), _ = jax.lax.scan(
-        run_segment, (fast_state, position), (*scan_batch, segment_indices))
-    return fast_state, position
-
-
-def robottt_segment_accumulate(
-    config, rng, state, batch, fast_state, position, segment_index, accumulated):
-    grads, numerator, count, fast_state, position = robottt_segment_grad(
-        config, rng, state, batch, fast_state, position, segment_index)
-    gradient_sum, numerator_sum, count_sum = accumulated
-    accumulated = (
-        jax.tree.map(jnp.add, gradient_sum, grads),
-        numerator_sum + numerator,
-        count_sum + count,
-    )
-    return accumulated, fast_state, position
-
-
-def robottt_bundle_accumulate(
-    config, rng, state, batch, fast_state, position, segment_indices, accumulated):
-    grads, numerator, count, fast_state, position = robottt_bundle_grad(
-        config, rng, state, batch, fast_state, position, segment_indices)
-    gradient_sum, numerator_sum, count_sum = accumulated
-    accumulated = (
-        jax.tree.map(jnp.add, gradient_sum, grads),
-        numerator_sum + numerator,
-        count_sum + count,
-    )
-    return accumulated, fast_state, position
-
-
-def robottt_stream_bundle_accumulate(
-    config, rng, state, batch, fast_state, position, segment_indices, accumulated):
-    grads, numerator, count, fast_state, position = robottt_stream_bundle_grad(
-        config, rng, state, batch, fast_state, position, segment_indices)
-    gradient_sum, numerator_sum, count_sum = accumulated
-    accumulated = (
-        jax.tree.map(jnp.add, gradient_sum, grads),
-        numerator_sum + numerator,
-        count_sum + count,
-    )
-    return accumulated, fast_state, position
-
-
 def apply_robottt_gradients(config, state, grads, numerator, count):
     model = nnx.merge(state.model_def, state.params)
     grads = jax.tree.map(lambda value: value / jnp.maximum(count, 1), grads)
     return apply_gradients(
         config, state, model, grads, numerator / jnp.maximum(count, 1), None)[:2]
-
-
-@functools.partial(jax.jit, donate_argnums=(0,))
-def accumulate_robottt_gradients(accumulated, current):
-    gradient_sum, numerator_sum, count_sum = accumulated
-    grads, numerator, count = current
-    return jax.tree.map(jnp.add, gradient_sum, grads), numerator_sum + numerator, count_sum + count
-
 
 def get_stats(stats_dict) -> dict[str, at.Array]:
     mask = stats_dict["mask"]
@@ -618,6 +486,8 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
         if restore_manager is not checkpoint_manager:
             restore_manager.close()
     jax.block_until_ready(train_state)
+    if use_robottt:
+        train_state = alias_frozen_ema(config, train_state)
     logging.info(
         f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params.filter(nnx.All(nnx.Param)))}"
     )
@@ -644,142 +514,176 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     )
 
     if use_robottt:
-        fast_state_sharding = jax.sharding.NamedSharding(
-            mesh, jax.sharding.PartitionSpec(None, sharding.DATA_AXIS))
-        logging.info(f"RoboTTT fast-state sharding: {fast_state_sharding.spec}")
-        psegment_grad = jax.jit(functools.partial(robottt_segment_grad, config))
-        pbundle_grad = jax.jit(functools.partial(robottt_bundle_grad, config))
-        pstream_bundle_grad = jax.jit(
-            functools.partial(robottt_stream_bundle_grad, config))
-        psegment_forward = jax.jit(
-            functools.partial(robottt_segment_forward, config), donate_argnums=(3, 4))
-        pbundle_forward = jax.jit(
-            functools.partial(robottt_bundle_forward, config), donate_argnums=(3, 4))
-        psegment_accumulate = jax.jit(
-            functools.partial(robottt_segment_accumulate, config),
-            donate_argnums=(3, 4, 6),
-        )
-        pbundle_accumulate = jax.jit(
-            functools.partial(robottt_bundle_accumulate, config),
-            donate_argnums=(3, 4, 6),
-        )
-        pstream_bundle_accumulate = jax.jit(
-            functools.partial(robottt_stream_bundle_accumulate, config),
-            donate_argnums=(3, 4, 6),
-        )
-        papply_gradients = jax.jit(
+        pprepare_lane = jax.jit(functools.partial(prepare_lane, config))
+        pregroup_lane = jax.jit(regroup_lane, static_argnums=(3, 4))
+        pcollect_lane = jax.jit(
+            functools.partial(collect_lane, config), static_argnums=3)
+        ppack_context = jax.jit(pack_context)
+        pmerge_packed = jax.jit(
+            merge_packed, donate_argnums=(0, 1))
+        ppacked_grad = jax.jit(
+            functools.partial(packed_grad, config), donate_argnums=(1,))
+        papply_gradients_jit = jax.jit(
             functools.partial(apply_robottt_gradients, config),
             donate_argnums=(0, 1),
         )
-        pcreate_fast_state = jax.jit(create_fast_state, static_argnums=0, out_shardings=fast_state_sharding)
+
+        def papply_gradients(state, gradients, numerator, count):
+            stripped_state = strip_frozen_ema(config, state)
+            state, info = papply_gradients_jit(
+                stripped_state, gradients, numerator, count)
+            return alias_frozen_ema(config, state), info
+
         def run_robottt_batch(state, host_batch, microbatch_size, segment_length):
             gradient_sum = None
             numerator_sum, count_sum = jnp.float32(0), jnp.int32(0)
-            segment_calls = 0
-            padding_segments_skipped = 0
-            context_forward_calls = 0
-            bundle_size = int(os.environ.get("ROBOTTT_BUNDLE", "1"))
-            accumulation = os.environ.get("ROBOTTT_GRAD_ACCUMULATION", "tree_add")
-            context_forward = os.environ.get("ROBOTTT_CONTEXT_FORWARD") == "1"
-            stream_bundle = os.environ.get("ROBOTTT_STREAM_BUNDLE") == "1"
-            for micro_start in range(0, config.batch_size, microbatch_size):
-                micro_slice = slice(micro_start, micro_start + microbatch_size)
-                fast_state = pcreate_fast_state(microbatch_size)
-                position = jax.device_put(jnp.zeros(microbatch_size, jnp.int32), data_sharding)
-                micro_rng = jax.random.fold_in(jax.random.fold_in(train_rng, state.step), micro_start // microbatch_size)
-                segments = []
-                segment_indices = []
-                for segment_start in range(0, host_batch["actions"].shape[1], segment_length):
-                    segment = jax.tree.map(
-                        lambda value: np.asarray(
-                            value[micro_slice, segment_start : segment_start + segment_length]
-                        ),
+            packed_calls = 0
+            temporal_blocks = host_batch["actions"].shape[1]
+            segment_count = temporal_blocks // segment_length
+            if temporal_blocks <= 32:
+                lane_group_size = 8
+            elif temporal_blocks == 64:
+                lane_group_size = 2
+            else:
+                lane_group_size = 1
+            plans = padding_plan(
+                host_batch["robottt"]["valid"], microbatch_size,
+                lane_group_size, segment_length,
+            )
+            pending_packed = None
+            pending_count = 0
+
+            def accumulate_packed(packed):
+                nonlocal gradient_sum, numerator_sum, count_sum, packed_calls
+                with sharding.set_mesh(mesh):
+                    gradients, numerator, count = ppacked_grad(
+                        state, packed)
+                if gradient_sum is None:
+                    gradient_sum = gradients
+                    numerator_sum = numerator
+                    count_sum = count
+                else:
+                    gradient_sum = jax.tree.map(
+                        jnp.add, gradient_sum, gradients)
+                    numerator_sum += numerator
+                    count_sum += count
+                packed_calls += 1
+
+            for group_start in sorted({plan[0] for plan in plans}):
+                group_plans = [plan for plan in plans if plan[0] == group_start]
+                group_stop = group_plans[0][1]
+                prepared_lanes = []
+                mask_lanes = []
+                for lane_start in range(
+                    group_start, group_stop, microbatch_size):
+                    lane_slice = slice(
+                        lane_start, lane_start + microbatch_size)
+                    lane_batch = jax.tree.map(
+                        lambda value, selected=lane_slice: np.asarray(
+                            value[selected]),
                         host_batch,
                     )
-                    if (
-                        os.environ.get("ROBOTTT_PADDING_SKIP") == "1"
-                        and not np.any(segment["robottt"]["valid"])
-                    ):
-                        padding_segments_skipped += 1
-                        continue
-                    segments.append(segment)
-                    segment_indices.append(segment_start // segment_length)
-                work_bundles = []
-                for segment, segment_index in zip(segments, segment_indices, strict=True):
-                    is_context = (
-                        context_forward
-                        and np.any(segment["robottt"]["valid"])
-                        and not np.any(segment["robottt"]["outer"])
+                    masks = lane_batch.pop("robottt")
+                    actions = lane_batch.pop("actions")
+                    device_batch = jax.device_put(
+                        (
+                            HistAugObservation.from_dict(lane_batch),
+                            actions, masks,
+                        ),
+                        data_sharding,
                     )
-                    if (
-                        not work_bundles
-                        or len(work_bundles[-1]) == bundle_size
-                        or work_bundles[-1][0][2] != is_context
-                    ):
-                        work_bundles.append([])
-                    work_bundles[-1].append((segment, segment_index, is_context))
-                for work_bundle in work_bundles:
-                    bundle = [item[0] for item in work_bundle]
-                    indices = np.asarray([item[1] for item in work_bundle])
-                    is_context = work_bundle[0][2]
-                    if len(bundle) == 1:
-                        segment = bundle[0]
-                        masks = segment.pop("robottt")
-                        actions = segment.pop("actions")
-                        device_batch = jax.device_put(
-                            (HistAugObservation.from_dict(segment), actions, masks), data_sharding)
-                        grad_function = psegment_grad
-                        forward_function = psegment_forward
-                        accumulate_function = psegment_accumulate
-                        grad_args = (device_batch, fast_state, position, int(indices[0]))
-                    else:
-                        segment = jax.tree.map(lambda *values: np.stack(values, axis=1), *bundle)
-                        masks = segment.pop("robottt")
-                        actions = segment.pop("actions")
-                        device_batch = jax.device_put(
-                            (HistAugObservation.from_dict(segment), actions, masks), data_sharding)
-                        grad_function = pbundle_grad
-                        forward_function = pbundle_forward
-                        accumulate_function = pbundle_accumulate
-                        if stream_bundle:
-                            grad_function = pstream_bundle_grad
-                            accumulate_function = pstream_bundle_accumulate
-                        grad_args = (device_batch, fast_state, position, jax.device_put(indices))
+                    lane_rng = jax.random.fold_in(
+                        jax.random.fold_in(train_rng, state.step),
+                        lane_start // microbatch_size,
+                    )
                     with sharding.set_mesh(mesh):
-                        if is_context:
-                            fast_state, position = forward_function(micro_rng, state, *grad_args)
-                        elif accumulation == "fused_accum" and gradient_sum is not None:
-                            accumulated, fast_state, position = accumulate_function(
-                                micro_rng,
-                                state,
-                                *grad_args,
-                                (gradient_sum, numerator_sum, count_sum),
+                        prepared, masks = pprepare_lane(
+                            lane_rng, state, device_batch,
+                            jax.device_put(np.arange(segment_count)),
+                        )
+                    prepared_lanes.append(prepared)
+                    mask_lanes.append(masks)
+                prepared_lanes = jax.tree.map(
+                    lambda *values: jnp.stack(values), *prepared_lanes)
+                mask_lanes = jax.tree.map(
+                    lambda *values: jnp.stack(values), *mask_lanes)
+
+                for _, _, sample_indices, lane_blocks in group_plans:
+                    with sharding.set_mesh(mesh):
+                        prepared, masks = pregroup_lane(
+                            prepared_lanes, mask_lanes,
+                            jax.device_put(sample_indices),
+                            lane_blocks, microbatch_size)
+                        context = pcollect_lane(
+                            state, prepared, masks, segment_length)
+                    global_indices = group_start + sample_indices
+                    outer = np.asarray(
+                        host_batch["robottt"]["outer"][
+                            global_indices, :lane_blocks
+                        ]
+                    ).reshape(
+                        (
+                            microbatch_size,
+                            lane_blocks // segment_length,
+                            segment_length,
+                        )
+                    )
+                    pair_segments, pair_samples = np.nonzero(
+                        np.any(outer, axis=-1).T
+                    )
+
+                    def pack_pairs(pair_start, pair_count):
+                        pair_stop = pair_start + pair_count
+                        pad = PACKED_SEGMENTS - pair_count
+                        segment_indices = np.pad(
+                            pair_segments[pair_start:pair_stop], (0, pad))
+                        packed_sample_indices = np.pad(
+                            pair_samples[pair_start:pair_stop], (0, pad))
+                        packed_valid = np.arange(PACKED_SEGMENTS) < pair_count
+                        with sharding.set_mesh(mesh):
+                            return ppack_context(
+                                context,
+                                jax.device_put(segment_indices),
+                                jax.device_put(packed_sample_indices),
+                                jax.device_put(packed_valid),
                             )
-                            gradient_sum, numerator_sum, count_sum = accumulated
-                        else:
-                            grads, numerator, count, fast_state, position = grad_function(
-                                micro_rng, state, *grad_args)
-                    segment_calls += 1
-                    if is_context:
-                        context_forward_calls += 1
-                    elif accumulation == "fused_accum" and gradient_sum is not None:
-                        pass
-                    elif gradient_sum is None:
-                        gradient_sum, numerator_sum, count_sum = grads, numerator, count
-                    elif accumulation == "jitted_tree_add":
-                        gradient_sum, numerator_sum, count_sum = accumulate_robottt_gradients(
-                            (gradient_sum, numerator_sum, count_sum), (grads, numerator, count))
-                    else:
-                        gradient_sum = jax.tree.map(jnp.add, gradient_sum, grads)
-                        numerator_sum += numerator
-                        count_sum += count
+
+                    pair_start = 0
+                    if pending_packed is not None and len(pair_segments):
+                        pair_count = min(
+                            PACKED_SEGMENTS - pending_count,
+                            len(pair_segments),
+                        )
+                        right_packed = pack_pairs(pair_start, pair_count)
+                        with sharding.set_mesh(mesh):
+                            pending_packed = pmerge_packed(
+                                pending_packed,
+                                right_packed,
+                                jnp.int32(pending_count),
+                            )
+                        pending_count += pair_count
+                        pair_start += pair_count
+                        if pending_count == PACKED_SEGMENTS:
+                            accumulate_packed(pending_packed)
+                            pending_packed = None
+                            pending_count = 0
+                    while len(pair_segments) - pair_start >= PACKED_SEGMENTS:
+                        accumulate_packed(
+                            pack_pairs(pair_start, PACKED_SEGMENTS))
+                        pair_start += PACKED_SEGMENTS
+                    if pair_start < len(pair_segments):
+                        pending_count = len(pair_segments) - pair_start
+                        pending_packed = pack_pairs(
+                            pair_start, pending_count)
+            if pending_packed is not None:
+                accumulate_packed(pending_packed)
             with sharding.set_mesh(mesh):
                 return (
                     *papply_gradients(state, gradient_sum, numerator_sum, count_sum),
                     {
-                        "segment_calls": segment_calls,
-                        "padding_segments_skipped": padding_segments_skipped,
-                        "context_forward_calls": context_forward_calls,
+                        "segment_calls": packed_calls,
+                        "padding_segments_skipped": 0,
+                        "context_forward_calls": len(plans),
                     },
                 )
 
@@ -797,7 +701,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
         start_step += config.resum_ckpt_id
         tentative_run_step += config.resum_ckpt_id
     microbatch_by_stage = {
-        1: 64,
+        1: 8,
         4: 16,
         8: 16,
         32: 8,
@@ -823,6 +727,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             jax.block_until_ready(train_state)
             jax.clear_caches()
             gc.collect()
+            infos = []
             stage_start, temporal_blocks = next_stage_start, next_temporal_blocks
             data_loader = make_loader(
                 seed=config.seed + temporal_blocks, temporal_blocks=temporal_blocks,

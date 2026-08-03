@@ -44,6 +44,11 @@ class Args:
     model_ckpt_id: int = 80000
     robottt_mode: Optional[str] = None
     episodes_per_task: Optional[int] = None
+    episode_start: int = 0
+    episode_stride: int = 1
+    dagger_dir: Optional[str] = None
+    dagger_dataset: str = "train"
+    dagger_stagnation_steps: int = 128
 
     # task control
     re_eval_tasks: str = "" # tasks split by comma
@@ -99,6 +104,8 @@ class EpisodeEvaluator:
         success_flag = "unknown"
         subgoal = None
         last_subgoal = None
+        previous_progress = env_runner.subtask_progress
+        stagnant_steps = 0
 
         while True:
             subgoal_predictor.step(epstate)
@@ -132,6 +139,21 @@ class EpisodeEvaluator:
             if stop_flag and success_flag == "error":
                 raise RuntimeError(f"{env_runner.info.get('exception_type')}: {env_runner.info.get('error_message')}")
             epstate.count += 1
+            progress = env_runner.subtask_progress
+            stagnant_steps = stagnant_steps + 1 if progress == previous_progress else 0
+            previous_progress = progress
+            if self.args.dagger_dir and (
+                env_runner.subtask_failed
+                or stagnant_steps >= self.args.dagger_stagnation_steps
+            ):
+                intervention_progress = env_runner.subtask_progress
+                expert_success = env_runner.finish_with_expert()
+                print(
+                    f"DAgger intervention: progress {intervention_progress}"
+                    f" -> {env_runner.subtask_progress}, success={expert_success}"
+                )
+                success_flag = "success" if expert_success else "fail"
+                break
 
             if epstate.count > self.args.max_steps:
                 success_flag = "timeout"
@@ -322,10 +344,11 @@ def evaluate(args: Args):
     check_args(args)
     if args.robottt_mode not in (None, "normal", "no_video", "no_carry"):
         raise ValueError(f"Unsupported RoboTTT mode: {args.robottt_mode}")
+    if args.dagger_dataset not in ("train", "test"):
+        raise ValueError(f"Unsupported DAgger dataset: {args.dagger_dataset}")
 
     save_dir = setup_save_directory(args)
     video_save_dir = save_dir / "videos"
-
     log_dict = setup_log_dict(save_dir, args)
     details_path = save_dir / "details.json"
     details = json.load(open(details_path)) if details_path.exists() else {}
@@ -344,81 +367,83 @@ def evaluate(args: Args):
 
     subgoal_predictor = build_subgoal_predictor(args, save_dir)
     evaluator = EpisodeEvaluator(args, save_dir)
+    for task_name in task_names:
+        if task_name not in log_dict:
+            log_dict[task_name] = {}
 
-    while not os.path.exists(save_dir / "log.json"):
-        for task_name in task_names:
-            if task_name not in log_dict:
-                log_dict[task_name] = {}
+        env_runner = EnvRunner(
+            task_name,
+            video_save_dir,
+            max_steps=args.max_steps,
+            dagger_dir=args.dagger_dir,
+            dataset=args.dagger_dataset if args.dagger_dir else "test",
+        )
+        num_episodes = min(env_runner.num_episodes, args.episodes_per_task or env_runner.num_episodes)
+        success_flag = "unknown"
 
-            env_runner = EnvRunner(task_name, video_save_dir, max_steps=args.max_steps)
-            num_episodes = min(env_runner.num_episodes, args.episodes_per_task or env_runner.num_episodes)
+        for episode_id in range(args.episode_start, num_episodes, args.episode_stride):
+            if str(episode_id) in log_dict.get(task_name, {}):
+                print(f"[robomme] episode {episode_id} already evaluated, skipping...")
+                continue
 
-            success_flag = "unknown"
+            env_runner.make_env(episode_id)
+            print(f"\n[robomme] env for task {task_name} episode {episode_id} setup finished")
 
-            for episode_id in range(num_episodes):
-                if str(episode_id) in log_dict[task_name]:
-                    print(f"[robomme] episode {episode_id} already evaluated, skipping...")
-                    continue
-
-                env_runner.make_env(episode_id)
-                print(f"\n[robomme] env for task {task_name} episode {episode_id} setup finished")
-
-                try:
-                    success_flag = evaluator.eval_each_episode(env_runner, subgoal_predictor, video_save_dir)
-                    if success_flag == "unknown":
-                        log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
-                        evaluator.episode_metrics["error"] = "unknown policy response"
-                    else:
-                        log_dict[task_name][episode_id] = success_flag == "success"
-                    if args.robottt_mode is not None:
-                        details[f"{task_name}/{episode_id}"] = evaluator.episode_metrics
-                except Exception as e:
-                    print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
+            try:
+                success_flag = evaluator.eval_each_episode(env_runner, subgoal_predictor, video_save_dir)
+                if success_flag == "unknown":
                     log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
-                    details[f"{task_name}/{episode_id}"] = {"error": str(e)}
-                    if hasattr(evaluator, "client"):
-                        evaluator.client.close()
-
-                env_runner.close_env()
-                with open(save_dir / "progress.json", "w") as f:
-                    json.dump(log_dict, f, indent=2)
+                    evaluator.episode_metrics["error"] = "unknown policy response"
+                else:
+                    log_dict[task_name][episode_id] = success_flag == "success"
                 if args.robottt_mode is not None:
-                    with open(details_path, "w") as f:
-                        json.dump(details, f, indent=2)
+                    details[f"{task_name}/{episode_id}"] = evaluator.episode_metrics
+            except Exception as e:
+                print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
+                log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
+                details[f"{task_name}/{episode_id}"] = {"error": str(e)}
+                if hasattr(evaluator, "client"):
+                    evaluator.client.close()
 
-                if success_flag == "unknown" and args.robottt_mode is None:
-                    print("API calling error, aborting...")
-                    return
-
-            del env_runner
-            time.sleep(1)
-
-        try:
-            def wilson(successes, count):
-                probability = successes / count
-                center = (probability + 1.96**2 / (2 * count)) / (1 + 1.96**2 / count)
-                margin = 1.96 * np.sqrt(probability * (1 - probability) / count + 1.96**2 / (4 * count**2)) / (1 + 1.96**2 / count)
-                return [center - margin, center + margin]
-
-            final_results = {}
-            final_results["success_rate"] = {
-                task_name: sum(log_dict[task_name].values()) / len(log_dict[task_name].values())
-                for task_name in log_dict.keys()
-            }
-            final_results["total_success_rate"] = (
-                sum(final_results["success_rate"].values()) / len(final_results["success_rate"].values())
-            )
+            env_runner.close_env()
+            with open(save_dir / "progress.json", "w") as f:
+                json.dump(log_dict, f, indent=2)
             if args.robottt_mode is not None:
-                final_results["episode_details"] = details
-                final_results["wilson_95"] = {
-                    task_name: wilson(sum(values.values()), len(values)) for task_name, values in log_dict.items()}
-                all_results = [value for values in log_dict.values() for value in values.values()]
-                final_results["total_wilson_95"] = wilson(sum(all_results), len(all_results))
-            with open(save_dir / "log.json", "w") as f:
-                json.dump(final_results, f, indent=2)
-        except Exception as e:
-            print(f"Error saving final results: {e}")
-            time.sleep(1)
+                with open(details_path, "w") as f:
+                    json.dump(details, f, indent=2)
+
+            if success_flag == "unknown" and args.robottt_mode is None:
+                print("API calling error, aborting...")
+                return
+
+        del env_runner
+        time.sleep(1)
+
+    try:
+        def wilson(successes, count):
+            probability = successes / count
+            center = (probability + 1.96**2 / (2 * count)) / (1 + 1.96**2 / count)
+            margin = 1.96 * np.sqrt(probability * (1 - probability) / count + 1.96**2 / (4 * count**2)) / (1 + 1.96**2 / count)
+            return [center - margin, center + margin]
+
+        final_results = {}
+        final_results["success_rate"] = {
+            task_name: sum(log_dict[task_name].values()) / len(log_dict[task_name].values())
+            for task_name in log_dict.keys()
+        }
+        final_results["total_success_rate"] = (
+            sum(final_results["success_rate"].values()) / len(final_results["success_rate"].values())
+        )
+        if args.robottt_mode is not None:
+            final_results["episode_details"] = details
+            final_results["wilson_95"] = {
+                task_name: wilson(sum(values.values()), len(values)) for task_name, values in log_dict.items()}
+            all_results = [value for values in log_dict.values() for value in values.values()]
+            final_results["total_wilson_95"] = wilson(sum(all_results), len(all_results))
+        with open(save_dir / "log.json", "w") as f:
+            json.dump(final_results, f, indent=2)
+    except Exception as e:
+        print(f"Error saving final results: {e}")
 
 
 if __name__ == "__main__":
