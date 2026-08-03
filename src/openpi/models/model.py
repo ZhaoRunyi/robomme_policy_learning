@@ -87,8 +87,11 @@ class Observation(Generic[ArrayT]):
     that should be produced by the data transforms.
     """
 
-    # Images, in [-1, 1] float32.
-    images: dict[str, at.Float[ArrayT, "*b h w c"]]
+    # Images in [-1, 1] float32, or uint8 before explicit device staging.
+    images: dict[
+        str,
+        at.Float[ArrayT, "*b h w c"] | at.UInt8[ArrayT, "*b h w c"],
+    ]
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
@@ -107,17 +110,20 @@ class Observation(Generic[ArrayT]):
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     @classmethod
-    def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
+    def from_dict(
+        cls, data: at.PyTree[ArrayT], *, normalize_images: bool = True
+    ) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        if normalize_images:
+            for key in data["image"]:
+                if data["image"][key].dtype == np.uint8:
+                    data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
+                    data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],

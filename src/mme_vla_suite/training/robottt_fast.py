@@ -9,12 +9,16 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import openpi.training.sharding as sharding
 
 from mme_vla_suite.models.integration.history_observation import preprocess_observation
 from mme_vla_suite.models.integration.history_pi0 import make_attn_mask
 from mme_vla_suite.models.representation.robottt import create_fast_state
 
 PACKED_SEGMENTS = 32
+IMAGE_LOOKUP = (
+    np.arange(256, dtype=np.uint8).astype(np.float32) / 255.0 * 2.0 - 1.0
+)
 
 
 class PreparedSequence(NamedTuple):
@@ -34,6 +38,29 @@ class LaneContext(NamedTuple):
     boundary_positions: jax.Array
 
 
+def make_boundary_transport_jit(function, mesh, *, donate_argnums=()):
+    """Shard only the P32 fast-state boundary rows across data devices."""
+    replicated = jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec()
+    )
+    output_shardings = LaneContext(
+        replicated,
+        replicated,
+        replicated,
+        replicated,
+        replicated,
+        jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec(None, sharding.BATCH_AXIS)
+        ),
+        replicated,
+    )
+    return jax.jit(
+        function,
+        donate_argnums=donate_argnums,
+        out_shardings=output_shardings,
+    )
+
+
 def _flatten_sequence(tree, batch_size, temporal_blocks):
     return jax.tree.map(
         lambda value: value.reshape(
@@ -43,11 +70,35 @@ def _flatten_sequence(tree, batch_size, temporal_blocks):
     )
 
 
+def _embed_suffix(model, observation, actions, time):
+    batch_size, temporal_blocks = time.shape
+    suffix = model.embed_suffix(
+        observation,
+        actions.reshape((batch_size * temporal_blocks, *actions.shape[2:])),
+        time.reshape((batch_size * temporal_blocks,)),
+    )
+    tokens, mask, ar_mask, na_mask, adarms_cond = suffix
+    return (
+        tokens.reshape((batch_size, temporal_blocks, *tokens.shape[1:])),
+        mask,
+        ar_mask,
+        na_mask,
+        adarms_cond.reshape((batch_size, temporal_blocks, -1)),
+    )
+
+
 def prepare_lane(config, rng, train_state, batch, segment_indices):
     """Draw stochastic inputs before padding-aware sample regrouping."""
     del config
     model = nnx.merge(train_state.model_def, train_state.params)
     observation, actions, masks = batch
+    observation = observation.replace(
+        images={
+            key: jnp.asarray(IMAGE_LOOKUP)[image]
+            if image.dtype == jnp.uint8 else image
+            for key, image in observation.images.items()
+        }
+    )
     batch_size, temporal_blocks = actions.shape[:2]
     segment_length = temporal_blocks // segment_indices.shape[0]
     observation = _flatten_sequence(
@@ -134,18 +185,12 @@ def collect_lane(config, train_state, prepared, masks, segment_length):
     prefix_tokens, prefix_mask, prefix_ar, prefix_na, _ = (
         model.embed_prefix(flat_observation)
     )
-    flat_actions = prepared.noisy_actions.reshape(
-        (
-            batch_size * temporal_blocks,
-            *prepared.noisy_actions.shape[2:],
-        )
-    )
-    suffix = model.embed_suffix(
+    suffix_tokens, suffix_mask, suffix_ar, suffix_na, adarms_cond = _embed_suffix(
+        model,
         flat_observation,
-        flat_actions,
-        prepared.time.reshape((batch_size * temporal_blocks,)),
+        prepared.noisy_actions,
+        prepared.time,
     )
-    suffix_tokens, suffix_mask, suffix_ar, suffix_na, adarms_cond = suffix
     prefix_result = model.PaliGemma.llm(
         [prefix_tokens, None],
         mask=make_attn_mask(prefix_mask, prefix_ar, prefix_na),
@@ -174,9 +219,6 @@ def collect_lane(config, train_state, prepared, masks, segment_length):
     )
     positions = jnp.cumsum(input_mask, axis=1) - 1
     prefix_length = prefix_tokens.shape[1]
-    suffix_tokens = suffix_tokens.reshape(
-        (batch_size, temporal_blocks, *suffix_tokens.shape[1:])
-    )
     suffix_positions = positions[:, prefix_length:].reshape(
         (batch_size, temporal_blocks, -1)
     )
@@ -187,9 +229,6 @@ def collect_lane(config, train_state, prepared, masks, segment_length):
             suffix_tokens.shape[2],
             attention_mask.shape[-1],
         )
-    )
-    adarms_cond = adarms_cond.reshape(
-        (batch_size, temporal_blocks, -1)
     )
     valid = masks["valid"].astype(jnp.int32)
     block_positions = jnp.cumsum(valid, axis=1) - valid
@@ -305,7 +344,14 @@ def merge_packed(left, right, left_count):
     )
 
 
-def packed_grad(config, train_state, packed):
+def packed_grad(
+    config,
+    train_state,
+    packed,
+    gradient_sum,
+    numerator_sum,
+    count_sum,
+):
     """Differentiate one fixed-shape suffix-only segment batch."""
     model = nnx.merge(train_state.model_def, train_state.params)
     model.train()
@@ -316,23 +362,11 @@ def packed_grad(config, train_state, packed):
         observation = _flatten_sequence(
             prepared.observation, batch_size, segment_length
         )
-        noisy_actions = prepared.noisy_actions.reshape(
-            (
-                batch_size * segment_length,
-                *prepared.noisy_actions.shape[2:],
-            )
-        )
-        suffix = model.embed_suffix(
+        suffix_tokens, _, _, _, adarms_cond = _embed_suffix(
+            model,
             observation,
-            noisy_actions,
-            prepared.time.reshape((batch_size * segment_length,)),
-        )
-        suffix_tokens, _, _, _, adarms_cond = suffix
-        suffix_tokens = suffix_tokens.reshape(
-            (batch_size, segment_length, *suffix_tokens.shape[1:])
-        )
-        adarms_cond = adarms_cond.reshape(
-            (batch_size, segment_length, -1)
+            prepared.noisy_actions,
+            prepared.time,
         )
         valid = packed.masks["valid"].astype(jnp.int32)
         block_positions = (
@@ -374,7 +408,16 @@ def packed_grad(config, train_state, packed):
     (numerator, count), gradients = nnx.value_and_grad(
         loss_fn, argnums=diff_state, has_aux=True
     )(model)
-    return gradients, numerator, count
+    if gradient_sum is None:
+        return gradients, numerator, count
+    gradients, numerator, count = jax.lax.optimization_barrier(
+        (gradients, numerator, count)
+    )
+    return (
+        jax.tree.map(jnp.add, gradient_sum, gradients),
+        numerator_sum + numerator,
+        count_sum + count,
+    )
 
 
 def padding_plan(valid, microbatch_size, lane_group_size, segment_length):
@@ -414,11 +457,3 @@ def alias_frozen_ema(config, train_state):
         train_state,
         ema_params=nnx.State.merge(frozen_params, trainable_ema),
     )
-
-
-def strip_frozen_ema(config, train_state):
-    """Keep only trainable EMA leaves inside the optimizer JIT."""
-    trainable_ema, _ = train_state.ema_params.split(
-        config.trainable_filter, ...
-    )
-    return dataclasses.replace(train_state, ema_params=trainable_ema)
