@@ -35,8 +35,12 @@ class HistAugObservation(_Observation):
     symbolic_tokenized_prompt_mask: at.Bool[at.Array, "b l2"] | None = None
 
     @classmethod
-    def from_dict(cls, data: at.PyTree[ArrayT]) -> "HistAugObservation":
-        parent_obs = super().from_dict(data)
+    def from_dict(
+        cls, data: at.PyTree[ArrayT], *, normalize_images: bool = True
+    ) -> "HistAugObservation":
+        parent_obs = super().from_dict(
+            data, normalize_images=normalize_images
+        )
         return cls(
             # Base observation fields
             images=parent_obs.images,

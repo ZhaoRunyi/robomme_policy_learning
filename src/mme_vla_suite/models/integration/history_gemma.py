@@ -136,6 +136,29 @@ class HistoryBlock(nn.Module):
         if self.integration_type == "modulation":
             mem_attn = MemoryAttention(name="mem_attn")
 
+        robottt_fast_state, robottt_inner_mask, robottt_block_position, tbptt_segment_length = (
+            robottt
+        )
+        temporal_shape = (
+            robottt_inner_mask.shape[:2]
+            if robottt_inner_mask is not None and robottt_inner_mask.ndim == 3
+            else None
+        )
+        if temporal_shape is not None:
+            def flatten_temporal(value):
+                return value.reshape(
+                    (temporal_shape[0] * temporal_shape[1], *value.shape[2:])
+                )
+
+            xs = jax.tree.map(flatten_temporal, xs)
+            kv_cache = jax.tree.map(flatten_temporal, kv_cache)
+            positions = flatten_temporal(positions)
+            attn_mask = flatten_temporal(attn_mask)
+            adarms_cond = jax.tree.map(
+                lambda value: None if value is None else flatten_temporal(value),
+                adarms_cond,
+            )
+
         xs = sharding.activation_sharding_constraint(xs)
         drop = (
             nn.Dropout(self.dropout, self.dropout_bdims)
@@ -160,7 +183,7 @@ class HistoryBlock(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
+        post_attn, next_kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [
@@ -169,11 +192,67 @@ class HistoryBlock(nn.Module):
         ]
         xs = sharding.activation_sharding_constraint(xs)
 
-        robottt_fast_state, robottt_inner_mask, robottt_block_position = robottt
+        robottt_boundaries = None
         if self.integration_type == "layer" and xs[-1] is not None:
-            xs[-1], robottt_fast_state = RoboTTTLayer(name="robottt")(
-                xs[-1], robottt_fast_state, robottt_inner_mask, robottt_block_position
-            )
+            robottt_layer = RoboTTTLayer(name="robottt")
+            if temporal_shape is None:
+                xs[-1], robottt_fast_state = robottt_layer(
+                    xs[-1], robottt_fast_state,
+                    robottt_inner_mask, robottt_block_position,
+                )
+            else:
+                suffix = xs[-1].reshape((*temporal_shape, *xs[-1].shape[1:]))
+                segment_count = temporal_shape[1] // tbptt_segment_length
+
+                def segment_major(value):
+                    value = value.reshape(
+                        (
+                            temporal_shape[0],
+                            segment_count,
+                            tbptt_segment_length,
+                            *value.shape[2:],
+                        )
+                    )
+                    return jnp.swapaxes(value, 0, 1)
+
+                scan_inputs = (
+                    segment_major(suffix),
+                    segment_major(robottt_inner_mask),
+                    segment_major(robottt_block_position),
+                )
+
+                def update_segment(layer, state, inputs):
+                    hidden_slots, mask_slots, position_slots = inputs
+                    state = jax.tree.map(jax.lax.stop_gradient, state)
+                    boundary = state
+                    outputs = []
+                    for slot_index in range(tbptt_segment_length):
+                        hidden, state = layer(
+                            hidden_slots[:, slot_index],
+                            state,
+                            mask_slots[:, slot_index],
+                            position_slots[:, slot_index],
+                        )
+                        outputs.append(hidden)
+                    state = jax.tree.map(jax.lax.stop_gradient, state)
+                    return state, (jnp.stack(outputs, axis=1), boundary)
+
+                robottt_fast_state, (suffix, robottt_boundaries) = nn.scan(
+                    update_segment,
+                    variable_broadcast="params",
+                    split_rngs={"params": False},
+                    in_axes=0,
+                    out_axes=0,
+                    length=segment_count,
+                )(
+                    robottt_layer,
+                    robottt_fast_state,
+                    scan_inputs,
+                )
+                suffix = jnp.swapaxes(suffix, 0, 1).reshape(
+                    (temporal_shape[0], temporal_shape[1], *suffix.shape[3:])
+                )
+                xs[-1] = flatten_temporal(suffix)
             robottt_fast_state = sharding.activation_sharding_constraint(robottt_fast_state)
 
         out = []
@@ -208,13 +287,19 @@ class HistoryBlock(nn.Module):
             for x, y, gate in zip(xs, out, gates, strict=True)
         ]
         xs = sharding.activation_sharding_constraint(xs)
+        if temporal_shape is not None:
+            xs = jax.tree.map(
+                lambda value: value.reshape((*temporal_shape, *value.shape[1:])),
+                xs,
+            )
         
-        return xs, (kv_cache, robottt_fast_state)
+        return xs, (
+            None if temporal_shape is not None else next_kv_cache,
+            robottt_fast_state, robottt_boundaries,
+        )
 
 
-KVCache: TypeAlias = tuple[
-    at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]
-]
+KVCache: TypeAlias = tuple[jax.Array, jax.Array]
 
 
 @at.typecheck
@@ -255,10 +340,11 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-                (0, nn.broadcast, nn.broadcast),
+                (0, nn.broadcast, nn.broadcast, nn.broadcast),
                 nn.broadcast,
             ),
             length=self.configs[0].depth,
+            unroll=6,
         )(
             configs=self.configs,
             dropout=self.dropout,
@@ -277,10 +363,10 @@ class Module(nn.Module):
     def __call__(
         self,
         # list of token arrays, one for each expert, or None if that expert should not be run
-        embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
-        positions: at.Int[at.Array, "b t"],
-        mask: at.Bool[at.Array, "b t s"],
-        adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
+        embedded: Sequence[at.Float[at.Array, "*b _t _d"] | None],
+        positions: at.Int[at.Array, "*b t"],
+        mask: at.Bool[at.Array, "*b t s"],
+        adarms_cond: Sequence[at.Float[at.Array, "*b _d"] | None] | None = None,
         *,
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
@@ -289,13 +375,16 @@ class Module(nn.Module):
         deterministic: bool = True,
     ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
-        mask = jnp.asarray(mask)[:, None, :, :]
+        mask = jnp.asarray(mask)[..., None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
         if robottt is None:
-            robottt = (None, None, None)
+            robottt = (None, None, None, 1)
+        elif len(robottt) == 3:
+            robottt = (*robottt, 1)
+        temporal_robottt = robottt[1] is not None and robottt[1].ndim == 3
 
-        embedded, (kv_cache, robottt_fast_state) = self.layers(
+        embedded, (kv_cache, robottt_fast_state, robottt_boundaries) = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -311,11 +400,33 @@ class Module(nn.Module):
             e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None
         )
 
-        outputs = [
-            f(e, a)[0] if e is not None else e
-            for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ]
-        return (outputs, kv_cache, robottt_fast_state) if self.integration_type == "layer" else (outputs, kv_cache)
+        outputs = []
+        for norm, hidden, cond in zip(
+            self.final_norms, embedded, adarms_cond, strict=True
+        ):
+            if hidden is None:
+                outputs.append(None)
+                continue
+            if hidden.ndim == 4:
+                batch_size, temporal_blocks = hidden.shape[:2]
+                hidden = hidden.reshape(
+                    (batch_size * temporal_blocks, *hidden.shape[2:])
+                )
+                if cond is not None:
+                    cond = cond.reshape(
+                        (batch_size * temporal_blocks, *cond.shape[2:])
+                    )
+                hidden = norm(hidden, cond)[0]
+                hidden = hidden.reshape(
+                    (batch_size, temporal_blocks, *hidden.shape[1:])
+                )
+            else:
+                hidden = norm(hidden, cond)[0]
+            outputs.append(hidden)
+        if self.integration_type != "layer":
+            return outputs, kv_cache
+        result = outputs, kv_cache, robottt_fast_state
+        return (*result, robottt_boundaries) if temporal_robottt else result
 
     def init(self, use_adarms: Sequence[bool], mem_mods: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
@@ -334,6 +445,9 @@ class Module(nn.Module):
             ],
             mem_mask=[jnp.ones((1, 4), dtype=bool) if m else None for m in mem_mods],
             robottt=(
-                create_fast_state(1), jnp.ones((1, 1), dtype=bool), jnp.zeros((1,), dtype=jnp.int32)
+                create_fast_state(1),
+                jnp.ones((1, 1), dtype=bool),
+                jnp.zeros((1,), dtype=jnp.int32),
+                1,
             ) if self.integration_type == "layer" else None,
         )
