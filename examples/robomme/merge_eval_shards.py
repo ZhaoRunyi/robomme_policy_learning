@@ -29,11 +29,13 @@ def main():
     if not progress_paths:
         raise RuntimeError(f"No evaluation shards found under {args.shards_dir}")
 
+    failure_reasons = {}
     for progress_path in progress_paths:
         shard_dir = progress_path.parent
         shard_progress = json.loads(progress_path.read_text())
         shard_details_path = shard_dir / "details.json"
         shard_details = json.loads(shard_details_path.read_text())
+        failure_reasons.update(shard_progress.pop("_failure_reasons", {}))
         for task_name, task_results in shard_progress.items():
             output_results = progress.setdefault(task_name, {})
             duplicate = output_results.keys() & task_results.keys()
@@ -78,11 +80,12 @@ def main():
         "total_wilson_95": wilson(sum(all_results), len(all_results)),
     }
     for name, value in (
-        ("progress.json", progress),
+        ("progress.json", {**progress, "_failure_reasons": failure_reasons}),
         ("details.json", details),
         ("log.json", final_results),
     ):
         (args.output_dir / name).write_text(json.dumps(value, indent=2))
+    shutil.rmtree(args.shards_dir)
 
 
 if __name__ == "__main__":

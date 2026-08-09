@@ -274,6 +274,25 @@ class EpisodeEvaluator:
         return action_chunk[:exec_horizon]
 
 
+def failure_reason(env_runner: EnvRunner, success_flag: str, error: Exception | None = None) -> dict:
+    info = getattr(env_runner, "info", {}) or {}
+    reason = {
+        "outcome": success_flag,
+        "subtask_progress": env_runner.subtask_progress,
+        "current_task_name": getattr(env_runner.env.unwrapped, "current_task_name", None),
+        "current_task_failure": env_runner.subtask_failed,
+    }
+    if success_flag == "timeout":
+        reason["type"] = "timeout"
+    elif info.get("status") == "error" or error is not None:
+        reason["type"] = "environment_error"
+        reason["exception_type"] = info.get("exception_type", type(error).__name__ if error else None)
+        reason["error_message"] = info.get("error_message", str(error) if error else None)
+    else:
+        reason["type"] = "task_failure"
+    return reason
+
+
 def setup_save_directory(args: Args) -> Path:
     """Set up and validate save directories."""
     save_dir = (
@@ -319,7 +338,8 @@ def setup_log_dict(save_dir: Path, args: Args) -> dict:
     else:
         log_dict = {}
 
-    for task_name in log_dict:
+    log_dict.setdefault("_failure_reasons", {})
+    for task_name in [key for key in log_dict if not key.startswith("_")]:
         error_list = []
         for k, v in log_dict[task_name].items():
             if v == "error" and args.robottt_mode is None:
@@ -350,6 +370,7 @@ def evaluate(args: Args):
     save_dir = setup_save_directory(args)
     video_save_dir = save_dir / "videos"
     log_dict = setup_log_dict(save_dir, args)
+    failure_reasons = log_dict.setdefault("_failure_reasons", {})
     details_path = save_dir / "details.json"
     details = json.load(open(details_path)) if details_path.exists() else {}
     if args.robottt_mode is not None and (save_dir / "log.json").exists():
@@ -391,17 +412,22 @@ def evaluate(args: Args):
 
             try:
                 success_flag = evaluator.eval_each_episode(env_runner, subgoal_predictor, video_save_dir)
+                episode_key = f"{task_name}/{episode_id}"
                 if success_flag == "unknown":
                     log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
                     evaluator.episode_metrics["error"] = "unknown policy response"
                 else:
                     log_dict[task_name][episode_id] = success_flag == "success"
+                if success_flag != "success":
+                    failure_reasons[episode_key] = failure_reason(env_runner, success_flag)
                 if args.robottt_mode is not None:
-                    details[f"{task_name}/{episode_id}"] = evaluator.episode_metrics
+                    details[episode_key] = evaluator.episode_metrics
             except Exception as e:
                 print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
                 log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
-                details[f"{task_name}/{episode_id}"] = {"error": str(e)}
+                episode_key = f"{task_name}/{episode_id}"
+                failure_reasons[episode_key] = failure_reason(env_runner, "error", e)
+                details[episode_key] = {"error": str(e)}
                 if hasattr(evaluator, "client"):
                     evaluator.client.close()
 
@@ -427,9 +453,10 @@ def evaluate(args: Args):
             return [center - margin, center + margin]
 
         final_results = {}
+        task_results = {key: value for key, value in log_dict.items() if not key.startswith("_")}
         final_results["success_rate"] = {
-            task_name: sum(log_dict[task_name].values()) / len(log_dict[task_name].values())
-            for task_name in log_dict.keys()
+            task_name: sum(values.values()) / len(values)
+            for task_name, values in task_results.items()
         }
         final_results["total_success_rate"] = (
             sum(final_results["success_rate"].values()) / len(final_results["success_rate"].values())
@@ -437,8 +464,8 @@ def evaluate(args: Args):
         if args.robottt_mode is not None:
             final_results["episode_details"] = details
             final_results["wilson_95"] = {
-                task_name: wilson(sum(values.values()), len(values)) for task_name, values in log_dict.items()}
-            all_results = [value for values in log_dict.values() for value in values.values()]
+                task_name: wilson(sum(values.values()), len(values)) for task_name, values in task_results.items()}
+            all_results = [value for values in task_results.values() for value in values.values()]
             final_results["total_wilson_95"] = wilson(sum(all_results), len(all_results))
         with open(save_dir / "log.json", "w") as f:
             json.dump(final_results, f, indent=2)

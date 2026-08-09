@@ -158,6 +158,11 @@ class EnvRunner:
             obs, _, terminated, truncated, self.info = self.env.step(action)
         except Exception as e:
             print(f"Error: {e}")
+            self.info = {
+                "status": "error",
+                "exception_type": type(e).__name__,
+                "error_message": str(e),
+            }
             return (None, None, None), True, "error"
         if self.info.get("status") == "error":
             return (None, None, None), True, "error"
