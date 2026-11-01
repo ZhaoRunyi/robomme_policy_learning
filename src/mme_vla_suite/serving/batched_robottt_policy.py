@@ -32,6 +32,12 @@ class BatchedRoboTTTPolicy:
     def add_buffer(self, slot: int, observation: dict) -> None:
         self.lanes[slot].add_buffer(observation)
 
+    def save_reset_point(self, slot: int) -> None:
+        self.lanes[slot].save_reset_point()
+
+    def restore_reset_point(self, slot: int) -> None:
+        self.lanes[slot].restore_reset_point()
+
     def infer(self, requests):
         prepared = []
         noises = []

@@ -1,6 +1,5 @@
 import dataclasses
 import logging
-import os
 from typing import Any
 
 import einops
@@ -17,6 +16,7 @@ from openpi.models.pi0 import posemb_sincos
 import openpi.models.siglip as _siglip
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+from openpi.models.robottt import RoboTTTConfig
 
 from mme_vla_suite.models.integration.history_observation import (
     HistAugObservation,
@@ -81,6 +81,7 @@ class HistoryPi0Config(Pi0Config):
     use_history: bool = False  # Use history or not
     history_config: str | None = None  # history config
     max_token_len: int = 64
+    robottt: RoboTTTConfig = dataclasses.field(default_factory=RoboTTTConfig)
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "HistoryPi0":
@@ -246,6 +247,7 @@ class HistoryPi0(BaseModel):
     
 
         self.config = config
+        self.robottt_config = config.robottt
         self.use_history = config.use_history
         self.use_robottt = False
         
@@ -307,6 +309,7 @@ class HistoryPi0(BaseModel):
                         embed_dtype=config.dtype,
                         adarms=config.pi05,
                         integration_type=self.integration_type,
+                        robottt_config=config.robottt,
                     )
                 )
                 llm.lazy_init(
@@ -324,6 +327,7 @@ class HistoryPi0(BaseModel):
                         embed_dtype=config.dtype,
                         adarms=config.pi05,
                         integration_type=self.integration_type,
+                        robottt_config=config.robottt,
                     )
                 )
                 llm.lazy_init(
@@ -345,6 +349,7 @@ class HistoryPi0(BaseModel):
                     embed_dtype=config.dtype,
                     adarms=config.pi05,
                     integration_type=self.integration_type,
+                    robottt_config=config.robottt,
                 )
             )
             llm.lazy_init(
@@ -369,7 +374,7 @@ class HistoryPi0(BaseModel):
 
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         if self.use_robottt:
-            register_tokens = jax.random.normal(rngs.params(), (16, action_expert_config.width))
+            register_tokens = jax.random.normal(rngs.params(), (config.robottt.register_tokens, action_expert_config.width))
             self.robottt_register_tokens = nnx.Param(register_tokens / jnp.sqrt(action_expert_config.width))
         self.action_in_proj = nnx.Linear(
             config.action_dim, action_expert_config.width, rngs=rngs
@@ -576,12 +581,14 @@ class HistoryPi0(BaseModel):
         actions: Actions,
         *,
         train: bool = False,
-        robottt=None,
+        robottt_state=None,
         prefix=None,
     ) -> at.Float[at.Array, "*b ah"]:
         if self.use_robottt:
             noise_rng, time_rng = jax.random.split(rng)
-            fast_state, inner_token_mask, block_position = robottt
+            fast_state = robottt_state.fast_state
+            inner_token_mask = robottt_state.inner_mask
+            block_position = robottt_state.block_position
         else:
             fast_state = inner_token_mask = block_position = None
             preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
@@ -656,7 +663,7 @@ class HistoryPi0(BaseModel):
                 mask=attn_mask,
                 positions=positions,
                 adarms_cond=[None, adarms_cond],
-                robottt=(fast_state, inner_token_mask, block_position) if self.use_robottt else None,
+                robottt_state=_gemma.AdapterContext(fast_state, inner_token_mask, block_position) if self.use_robottt else None,
             )
             prefix_out, suffix_out = llm_result[0]
             fast_state = llm_result[2] if self.use_robottt else None
@@ -681,7 +688,7 @@ class HistoryPi0(BaseModel):
         observation = jax.tree.map(
             lambda value: value.reshape((batch_size, slot_count, *value.shape[1:])), observation)
         prefixes = None
-        if os.environ.get("ROBOTTT_PREFIX_BATCHING") == "1":
+        if self.robottt_config.prefix_batching:
             flat_observation = jax.tree.map(
                 lambda value: value.reshape((batch_size * slot_count, *value.shape[2:])), observation)
             prefixes = jax.tree.map(
@@ -699,7 +706,7 @@ class HistoryPi0(BaseModel):
                 jax.random.fold_in(jax.random.fold_in(rng, segment_index + 1), slot_index),
                 jax.tree.map(lambda value: value[:, slot_index], observation),
                 actions[:, slot_index],
-                robottt=(state, masks["inner"][:, slot_index], position),
+                robottt_state=_gemma.AdapterContext(state, masks["inner"][:, slot_index], position),
                 prefix=(
                     None
                     if prefixes is None
@@ -785,7 +792,7 @@ class HistoryPi0(BaseModel):
             positions = jnp.cumsum(prefix_mask, axis=1) - 1
             llm_result = self.PaliGemma.llm(
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions,
-                robottt=(fast_state, None, None) if self.use_robottt else None,
+                robottt_state=_gemma.AdapterContext(fast_state, None, None) if self.use_robottt else None,
             )
             kv_cache = llm_result[1]
 
@@ -845,7 +852,7 @@ class HistoryPi0(BaseModel):
                     positions=positions,
                     kv_cache=kv_cache,
                     adarms_cond=[None, adarms_cond],
-                    robottt=(fast_state, jnp.ones(suffix_mask.shape, dtype=jnp.bool_), block_position)
+                    robottt_state=_gemma.AdapterContext(fast_state, jnp.ones(suffix_mask.shape, dtype=jnp.bool_), block_position)
                     if self.use_robottt else None,
                 )
                 prefix_out, suffix_out = llm_result[0]

@@ -80,3 +80,15 @@ class MMEVLAWebsocketClientPolicy(WebsocketClientPolicy):
         self._ws.send(data)
         response = self._ws.recv()
         return msgpack_numpy.unpackb(response)
+
+    def save_reset_point(self) -> Dict:
+        data = self._packer.pack({"save_reset_point": True})
+        self._ws.send(data)
+        response = self._ws.recv()
+        return msgpack_numpy.unpackb(response)
+
+    def restore_reset_point(self) -> Dict:
+        data = self._packer.pack({"restore_reset_point": True})
+        self._ws.send(data)
+        response = self._ws.recv()
+        return msgpack_numpy.unpackb(response)

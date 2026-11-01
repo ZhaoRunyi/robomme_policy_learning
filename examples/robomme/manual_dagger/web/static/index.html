@@ -1,0 +1,745 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RoboTTT Manual DAgger</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #fff; color: #111; }
+    main { width: min(1180px, 96vw); margin: 18px auto 28px; }
+    .topline { display: grid; grid-template-columns: 1fr auto; gap: 16px; align-items: center; }
+    h1 { margin: 0; font-size: 24px; font-weight: 650; }
+    #connection { font-size: 15px; }
+    .prompt { min-height: 92px; margin: 14px 0; padding: 14px 16px; border: 1px solid #bbb;
+      border-radius: 8px; background: #fff; font-size: 20px; line-height: 1.45; white-space: pre-wrap; }
+    .subtask { margin: -7px 0 14px; padding: 10px 16px; border: 1px solid #d2d2d2;
+      border-radius: 7px; background: #f7f7f7; font-size: 18px; line-height: 1.4; }
+    .subtask .label { display: inline; margin: 0 10px 0 0; font-size: 14px; }
+    .stage { border: 10px solid #777; background: #111; line-height: 0; overflow: hidden; }
+    .stage.policy { border-color: #1f9d55; }
+    .stage.paused { border-color: #d97706; }
+    .stage.expert, .stage.expert_pending { border-color: #dc2626; }
+    #control-stage { border-color: #2563eb; }
+    .video-label { margin: 12px 0 6px; font-size: 18px; font-weight: 650; line-height: 1.2; }
+    .frame { display: block; width: 100%; aspect-ratio: 2 / 1; object-fit: contain; }
+    #control-cache-video { display: none; background: #111; }
+    body.control-cache-mode #control-frame { display: none; }
+    body.control-cache-mode #control-cache-video { display: block; }
+    body.archive-mode #control-cache-video { display: none; }
+    .archive-frame { display: none; width: 100%; aspect-ratio: 2 / 1; object-fit: contain; background: #111; }
+    body.archive-mode .live-frame { display: none; }
+    body.archive-mode .archive-frame { display: block; }
+    body.archive-mode .live-filmstrip { display: none; }
+    .filmstrip.archive-filmstrip { display: none; }
+    body.archive-mode .filmstrip.archive-filmstrip { display: grid; }
+    .filmstrip { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center;
+      padding: 9px 2px 3px; line-height: 1.2; }
+    .filmstrip.control { grid-template-columns: 1fr auto auto; }
+    .filmstrip input { width: 100%; accent-color: #2563eb; }
+    .filmstrip button { min-height: 36px; padding: 6px 12px; border: 1px solid #a33;
+      border-radius: 6px; background: #fff; color: #8e1515; font: inherit; font-weight: 650; cursor: pointer; }
+    .filmstrip button:disabled { border-color: #bbb; color: #888; cursor: default; }
+    .frame-number { min-width: 164px; text-align: right; font-variant-numeric: tabular-nums; font-size: 15px; }
+    .collection { display: grid; grid-template-columns: minmax(190px, 1fr) minmax(150px, .7fr) auto auto;
+      gap: 9px; align-items: center; margin: 13px 0 4px; }
+    .collection select, .collection input, .collection button { min-height: 40px; border: 1px solid #aaa;
+      border-radius: 6px; background: #fff; color: #111; padding: 7px 10px; font: inherit; }
+    .collection button { cursor: pointer; font-weight: 600; }
+    .collection button.danger { color: #a11212; border-color: #d8a1a1; }
+    .saved { display: grid; grid-template-columns: minmax(280px, 1fr) auto auto auto auto;
+      gap: 9px; align-items: center; margin: 9px 0 4px; }
+    .saved select, .saved button, .review button { min-height: 40px; border: 1px solid #aaa;
+      border-radius: 6px; background: #fff; color: #111; padding: 7px 10px; font: inherit; }
+    .saved button, .review button { cursor: pointer; font-weight: 600; }
+    .saved button:disabled, .review button:disabled { color: #888; cursor: default; }
+    .progress-list { margin: 9px 0 2px; color: #444; font-size: 14px; line-height: 1.6; }
+    .status { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+    .cell { min-height: 64px; padding: 10px 12px; border: 1px solid #ccc; border-radius: 7px; }
+    .label { display: block; color: #555; font-size: 13px; margin-bottom: 5px; }
+    .value { font-size: 18px; overflow-wrap: anywhere; }
+    .message { margin-top: 10px; min-height: 50px; padding: 11px 13px; background: #f5f5f5;
+      border-left: 5px solid #333; font-size: 17px; line-height: 1.45; }
+    .review { display: flex; gap: 10px; justify-content: flex-end; margin-top: 10px; }
+    .review .keep { border-color: #1f9d55; color: #166534; }
+    .review .discard { border-color: #dc2626; color: #991b1b; }
+    .keys { margin-top: 14px; font-size: 17px; line-height: 1.9; }
+    kbd { min-width: 28px; display: inline-block; text-align: center; padding: 1px 7px; margin: 0 2px;
+      border: 1px solid #999; border-bottom-width: 3px; border-radius: 5px; background: #fafafa; font: inherit; }
+    @media (max-width: 760px) { .status { grid-template-columns: repeat(2, 1fr); } .prompt { font-size: 17px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="topline"><h1>RoboTTT Manual DAgger</h1><span id="connection">连接中…</span></div>
+  <div class="video-label">CONTROL（独立环境，不接受人工介入）</div>
+  <div id="control-stage" class="stage">
+    <img id="control-frame" class="frame live-frame" alt="control base and wrist cameras">
+    <video id="control-cache-video" class="frame live-frame" muted playsinline preload="auto"></video>
+    <video id="saved-control" class="archive-frame" muted playsinline preload="metadata"></video>
+  </div>
+  <div class="filmstrip control live-filmstrip">
+    <input id="control-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="control frame scrubber">
+    <span id="control-frame-number" class="frame-number">Frame - / -</span>
+    <button id="schedule-intervention" type="button" disabled>此帧介入</button>
+  </div>
+  <div class="filmstrip archive-filmstrip">
+    <input id="saved-control-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="saved control frame scrubber">
+    <span id="saved-control-frame-number" class="frame-number">Frame - / -</span>
+  </div>
+  <div id="prompt" class="prompt">正在准备完整 prompt…</div>
+  <div class="subtask"><span class="label">当前子任务</span><span id="subtask-text">正在准备…</span></div>
+  <div class="video-label">ENABLED（可人工介入）</div>
+  <div id="enabled-stage" class="stage">
+    <img id="enabled-frame" class="frame live-frame" alt="enabled base and wrist cameras">
+    <video id="saved-enabled" class="archive-frame" muted playsinline preload="metadata"></video>
+  </div>
+  <div class="filmstrip live-filmstrip">
+    <input id="enabled-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="enabled frame scrubber">
+    <span id="enabled-frame-number" class="frame-number">Frame - / -</span>
+  </div>
+  <div class="filmstrip archive-filmstrip">
+    <input id="saved-enabled-scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="saved enabled frame scrubber">
+    <span id="saved-enabled-frame-number" class="frame-number">Frame - / -</span>
+  </div>
+  <div class="collection">
+    <select id="next-task" aria-label="next task"></select>
+    <input id="next-seed" type="number" inputmode="numeric" placeholder="seed（留空则自动）" aria-label="optional seed">
+    <button id="set-next" type="button">设为下一条</button>
+    <button id="block-seed" class="danger" type="button">Block 当前 seed</button>
+  </div>
+  <div class="saved">
+    <select id="saved-buffer" aria-label="saved trajectories for current task"></select>
+    <button id="refresh-saved" type="button">刷新</button>
+    <button id="view-saved" type="button">查看已保存</button>
+    <button id="rerecord-saved" type="button">重录这条</button>
+    <button id="return-live" type="button" disabled>返回实时</button>
+  </div>
+  <div id="task-progress" class="progress-list">正在读取持久化采集进度…</div>
+  <div class="status">
+    <div class="cell"><span class="label">任务 / episode</span><span id="identity" class="value">-</span></div>
+    <div class="cell"><span class="label">阶段 / action source</span><span id="phase" class="value">-</span></div>
+    <div class="cell"><span class="label">官方 eval</span><span id="eval-success" class="value">enabled - · control -</span></div>
+    <div class="cell"><span class="label">播放速度</span><span id="fps" class="value">5 FPS</span></div>
+    <div class="cell"><span class="label">按键往返延迟</span><span id="latency" class="value">-</span></div>
+  </div>
+  <div id="message" class="message">等待服务器状态</div>
+  <div class="review">
+    <button id="keep-episode" class="keep" type="button" disabled>C　保留本条</button>
+    <button id="discard-episode" class="discard" type="button" disabled>D　丢弃本条</button>
+  </div>
+  <div class="keys">
+    <kbd>S</kbd> 开始 episode　
+    <kbd>I</kbd> 专家完成一个子任务后暂停（可再次按 I）　
+    <kbd>Z</kbd> 暂停/继续策略 rollout　
+    <kbd>R</kbd> 同 seed 重置 enabled　
+    <kbd>N</kbd> 立即丢弃并进入下一 episode　
+    <kbd>P</kbd> 提前结束并丢弃　
+    <kbd>C</kbd> episode 结束后保留　
+    <kbd>D</kbd> episode 结束后丢弃　
+    <kbd>B</kbd> block 当前 seed　
+    <kbd>+</kbd>/<kbd>-</kbd> 调整 FPS
+  </div>
+</main>
+<script>
+  const params = new URLSearchParams(location.search);
+  const token = params.get("token") || "";
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  let socket = null;
+  let reconnectTimer = null;
+  let reconnectAttempt = 0;
+  let connected = false;
+  let scheduleSubmitting = false;
+  const pending = new Map();
+  let controlFrames = [];
+  const controlFrameSequences = new Set();
+  let cachedControl = null;
+  let controlCacheKey = "";
+  let controlCacheTimer = null;
+  let controlCacheLoading = false;
+  let enabledFrames = [];
+  const enabledFrameSequences = new Set();
+  let followControlTail = true;
+  let followEnabledTail = true;
+  let episodeGeneration = -1;
+  let enabledGeneration = -1;
+  let state = null;
+  let archiveMode = false;
+  let savedEntries = [];
+  let savedTask = "";
+  let savedCount = -1;
+  const el = id => document.getElementById(id);
+
+  function clearControlFrames() {
+    for (const frame of controlFrames) URL.revokeObjectURL(frame.url);
+    controlFrames = [];
+    controlFrameSequences.clear();
+    cachedControl = null;
+    controlCacheKey = "";
+    controlCacheLoading = false;
+    clearTimeout(controlCacheTimer);
+    controlCacheTimer = null;
+    const cachedVideo = el("control-cache-video");
+    cachedVideo.pause();
+    cachedVideo.removeAttribute("src");
+    cachedVideo.load();
+    document.body.classList.remove("control-cache-mode");
+    followControlTail = true;
+    el("control-scrubber").max = "0";
+    el("control-scrubber").value = "0";
+    el("control-frame-number").textContent = "Frame - / -";
+    el("schedule-intervention").disabled = true;
+  }
+
+  function clearEnabledFrames() {
+    for (const frame of enabledFrames) URL.revokeObjectURL(frame.url);
+    enabledFrames = [];
+    enabledFrameSequences.clear();
+    followEnabledTail = true;
+    el("enabled-scrubber").max = "0";
+    el("enabled-scrubber").value = "0";
+    el("enabled-frame-number").textContent = "Frame - / -";
+  }
+
+  function showControlFrame(index) {
+    if (cachedControl) {
+      const bounded = Math.max(0, Math.min(index, cachedControl.frame_steps.length - 1));
+      const video = el("control-cache-video");
+      video.currentTime = bounded / cachedControl.video_fps;
+      el("control-scrubber").value = String(bounded);
+      el("control-frame-number").textContent = `Frame ${bounded + 1}/${cachedControl.frame_steps.length} · step ${cachedControl.frame_steps[bounded]} · cached`;
+      updateScheduleButton();
+      return;
+    }
+    if (!controlFrames.length) return;
+    const bounded = Math.max(0, Math.min(index, controlFrames.length - 1));
+    const frame = controlFrames[bounded];
+    el("control-frame").src = frame.url;
+    el("control-scrubber").value = String(bounded);
+    el("control-frame-number").textContent = `Frame ${frame.sequence} · step ${frame.step} · cached ${bounded + 1}/${controlFrames.length}`;
+    updateScheduleButton();
+  }
+
+  function appendControlFrame(sequence, step, url) {
+    if (cachedControl) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    if (controlFrameSequences.has(sequence)) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    const selectedSequence = selectedControlFrame()?.sequence;
+    const frame = {sequence, step, url};
+    const insertion = controlFrames.findIndex(item => item.sequence > sequence);
+    if (insertion < 0) controlFrames.push(frame);
+    else controlFrames.splice(insertion, 0, frame);
+    controlFrameSequences.add(sequence);
+    const last = controlFrames.length - 1;
+    el("control-scrubber").max = String(last);
+    if (followControlTail) showControlFrame(last);
+    else {
+      const selected = controlFrames.findIndex(item => item.sequence === selectedSequence);
+      showControlFrame(selected < 0 ? Number(el("control-scrubber").value) : selected);
+    }
+  }
+
+  function showEnabledFrame(index) {
+    if (!enabledFrames.length) return;
+    const bounded = Math.max(0, Math.min(index, enabledFrames.length - 1));
+    const frame = enabledFrames[bounded];
+    el("enabled-frame").src = frame.url;
+    el("enabled-scrubber").value = String(bounded);
+    el("enabled-frame-number").textContent = `Frame ${frame.sequence} · cached ${bounded + 1}/${enabledFrames.length}`;
+  }
+
+  function appendEnabledFrame(sequence, url) {
+    if (enabledFrameSequences.has(sequence)) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    enabledFrames.push({sequence, url});
+    enabledFrameSequences.add(sequence);
+    const last = enabledFrames.length - 1;
+    el("enabled-scrubber").max = String(last);
+    if (followEnabledTail) showEnabledFrame(last);
+    else showEnabledFrame(Number(el("enabled-scrubber").value));
+  }
+
+  function renderProgress(next) {
+    const counts = next.progress_counts || {};
+    const tasks = next.available_tasks || [];
+    const select = el("next-task");
+    const previous = select.value;
+    select.replaceChildren(...tasks.map(task => {
+      const option = document.createElement("option");
+      option.value = task;
+      option.textContent = `${task}　${counts[task] || 0}/${next.progress_target_per_task}`;
+      return option;
+    }));
+    select.value = tasks.includes(previous) ? previous : (next.next_task || tasks[0] || "");
+    const details = tasks.map(task => `${task} ${counts[task] || 0}`).join(" · ");
+    el("task-progress").textContent = `保留进度 ${next.progress_total_kept}/${next.progress_total_target}（不封顶） · blocked seeds ${next.blocked_seed_count} · ${details}`;
+    const currentCount = counts[next.task] || 0;
+    if (next.task && (next.task !== savedTask || currentCount !== savedCount)) {
+      savedTask = next.task;
+      savedCount = currentCount;
+      loadSaved(next.task);
+    }
+  }
+
+  function render(next) {
+    if (episodeGeneration >= 0 && next.episode_generation !== episodeGeneration) {
+      clearControlFrames();
+      clearEnabledFrames();
+    } else if (enabledGeneration >= 0 && next.enabled_generation !== enabledGeneration) {
+      clearEnabledFrames();
+    }
+    episodeGeneration = next.episode_generation;
+    enabledGeneration = next.enabled_generation;
+    state = next;
+    maybeLoadControlCache(next);
+    if (!archiveMode) {
+      el("prompt").textContent = next.prompt || "正在准备完整 prompt…";
+      el("subtask-text").textContent = next.current_subtask || "正在准备…";
+      el("identity").textContent = `${next.task || "-"} / ep${next.episode} / seed ${next.seed ?? "-"}`;
+    }
+    el("phase").textContent = `enabled ${next.phase}/${next.source} · control ${next.control_phase}/${next.control_source}`;
+    const evalLabel = value => value === true ? "SUCCESS" : value === false ? "FAIL" : "-";
+    el("eval-success").textContent = `enabled ${evalLabel(next.eval_success)} · control ${evalLabel(next.control_eval_success)}`;
+    el("fps").textContent = `${next.fps} FPS`;
+    const warmup = `prefetch E:${next.policy_prefetch_ready ? "ready" : "running"} · control cache ${next.control_cache_ready || 0}/${next.control_cache_target || 0}${next.control_cached ? " · current ready" : ""}`;
+    if (!archiveMode) {
+      el("message").textContent = `${next.message}　enabled step=${next.step}　control step=${next.control_step}　${warmup}　kept=${next.progress_total_kept}/${next.progress_total_target}　next=${next.next_task || "-"}`;
+    }
+    el("enabled-stage").className = `stage ${String(next.source).toLowerCase()}`;
+    if (cachedControl) {
+      el("control-cache-video").playbackRate = Math.max(0.1, next.fps / cachedControl.video_fps);
+    }
+    updateScheduleButton();
+    updateReviewButtons();
+    renderProgress(next);
+  }
+
+  function controlCacheUrl(path, next) {
+    const query = new URLSearchParams({
+      token,
+      task: next.task,
+      episode: String(next.episode),
+      seed: String(next.seed),
+    });
+    return `${path}?${query}`;
+  }
+
+  async function maybeLoadControlCache(next) {
+    if (!next.task || next.seed === null || next.seed === undefined || archiveMode) return;
+    const key = `${next.task}:${next.episode}:${next.seed}`;
+    if (cachedControl && controlCacheKey === key) return;
+    if (controlCacheLoading && controlCacheKey === key) return;
+    if (controlCacheTimer && controlCacheKey === key) return;
+    if (controlCacheKey !== key) {
+      clearTimeout(controlCacheTimer);
+      controlCacheKey = key;
+    }
+    controlCacheLoading = true;
+    try {
+      const response = await fetch(controlCacheUrl("/control-cache", next), {cache: "no-store"});
+      if (controlCacheKey !== key) return;
+      if (response.status === 202 || response.status === 404) {
+        controlCacheTimer = setTimeout(() => {
+          controlCacheTimer = null;
+          maybeLoadControlCache(next);
+        }, 1500);
+        return;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      if (!payload.ready || !payload.frame_steps?.length || controlCacheKey !== key) return;
+      cachedControl = payload;
+      const video = el("control-cache-video");
+      video.src = controlCacheUrl("/control-cache/media", next);
+      video.playbackRate = Math.max(0.1, next.fps / payload.video_fps);
+      document.body.classList.add("control-cache-mode");
+      el("control-scrubber").max = String(payload.frame_steps.length - 1);
+      el("control-scrubber").value = "0";
+      showControlFrame(0);
+      video.play().catch(() => {});
+    } catch (error) {
+      if (controlCacheKey === key) {
+        el("message").textContent = `control 缓存读取失败，后台重试：${error.message}`;
+        controlCacheTimer = setTimeout(() => {
+          controlCacheTimer = null;
+          maybeLoadControlCache(next);
+        }, 2000);
+      }
+    } finally {
+      if (controlCacheKey === key) controlCacheLoading = false;
+    }
+  }
+
+  function savedMediaUrl(entry, filename, kind) {
+    if (entry.archive_source === "takeover-reviewed") {
+      return `/saved/media?token=${encodeURIComponent(token)}&task=${encodeURIComponent(entry.task)}&source=takeover-reviewed&id=${encodeURIComponent(entry.id)}&kind=${encodeURIComponent(kind)}`;
+    }
+    return `/saved/media?token=${encodeURIComponent(token)}&task=${encodeURIComponent(entry.task)}&file=${encodeURIComponent(filename)}`;
+  }
+
+  async function loadSaved(task) {
+    const select = el("saved-buffer");
+    try {
+      const response = await fetch(`/saved?token=${encodeURIComponent(token)}&task=${encodeURIComponent(task)}`, {cache: "no-store"});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      if (task !== savedTask) return;
+      savedEntries = payload.entries || [];
+      select.replaceChildren(...savedEntries.map((entry, index) => {
+        const option = document.createElement("option");
+        option.value = String(index);
+        const evalStatus = entry.eval_success === true ? "SUCCESS" : entry.eval_success === false ? "FAIL" : "-";
+        const source = entry.archive_source === "takeover-reviewed" ? "repaired+takeover-audited" : "saved";
+        option.textContent = `ep${entry.episode} · seed ${entry.seed} · take ${entry.take} · eval ${evalStatus} · ${entry.intervened ? "intervened" : "policy"} · ${source}`;
+        return option;
+      }));
+      if (!savedEntries.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = `${task} 暂无已保存轨迹`;
+        select.replaceChildren(option);
+      }
+      updateSavedButtons();
+    } catch (error) {
+      savedEntries = [];
+      select.replaceChildren(new Option(`读取已保存轨迹失败：${error.message}`, ""));
+      updateSavedButtons();
+    }
+  }
+
+  function selectedSavedEntry() {
+    const index = Number(el("saved-buffer").value);
+    return Number.isInteger(index) ? savedEntries[index] || null : null;
+  }
+
+  function updateSavedButtons() {
+    const available = Boolean(selectedSavedEntry());
+    el("view-saved").disabled = !available;
+    el("rerecord-saved").disabled = !available || !connected;
+    el("return-live").disabled = !archiveMode;
+  }
+
+  function configureSavedScrubber(kind, frames, fps) {
+    const video = el(`saved-${kind}`);
+    const scrubber = el(`saved-${kind}-scrubber`);
+    const label = el(`saved-${kind}-frame-number`);
+    const videoFps = Math.max(1, Number(fps) || 30);
+
+    function setFrameCount(candidate) {
+      const count = Math.max(1, Number(candidate) || Math.floor(video.duration * videoFps) || 1);
+      scrubber.max = String(count - 1);
+      scrubber.value = "0";
+      label.textContent = `Frame 1/${count}`;
+      video.currentTime = 0;
+    }
+
+    video.onloadedmetadata = () => setFrameCount(frames);
+    video.onseeked = () => {
+      const count = Number(scrubber.max) + 1;
+      const index = Math.min(count - 1, Math.max(0, Math.round(video.currentTime * videoFps)));
+      scrubber.value = String(index);
+      label.textContent = `Frame ${index + 1}/${count}`;
+    };
+    scrubber.oninput = event => {
+      video.pause();
+      const index = Number(event.target.value);
+      video.currentTime = index / videoFps;
+      label.textContent = `Frame ${index + 1}/${Number(scrubber.max) + 1}`;
+    };
+    if (video.readyState >= 1) setFrameCount(frames);
+  }
+
+  function showSavedEntry() {
+    const entry = selectedSavedEntry();
+    if (!entry) return;
+    archiveMode = true;
+    document.body.classList.add("archive-mode");
+    el("saved-control").src = savedMediaUrl(entry, entry.control_video, "control");
+    el("saved-enabled").src = savedMediaUrl(entry, entry.enabled_video, "enabled");
+    configureSavedScrubber(
+      "control",
+      entry.control_video_frames,
+      entry.control_video_fps,
+    );
+    configureSavedScrubber(
+      "enabled",
+      entry.enabled_video_frames,
+      entry.enabled_video_fps,
+    );
+    el("prompt").textContent = entry.prompt || "（已保存轨迹没有 prompt）";
+    el("subtask-text").textContent = entry.current_subtask || "（旧轨迹未记录结束时子任务）";
+    el("identity").textContent = `${entry.task} / ep${entry.episode} / seed ${entry.seed} / take ${entry.take}（已保存）`;
+    el("message").textContent = "正在回看已保存的 control/enabled；重录会保留旧数据，并将同 task/seed 设为下一条。";
+    updateScheduleButton();
+    updateReviewButtons();
+    updateSavedButtons();
+  }
+
+  function returnToLive() {
+    archiveMode = false;
+    document.body.classList.remove("archive-mode");
+    for (const video of [el("saved-control"), el("saved-enabled")]) {
+      video.pause();
+      video.onloadedmetadata = null;
+      video.onseeked = null;
+      video.removeAttribute("src");
+      video.load();
+    }
+    for (const kind of ["control", "enabled"]) {
+      const scrubber = el(`saved-${kind}-scrubber`);
+      scrubber.oninput = null;
+      scrubber.max = "0";
+      scrubber.value = "0";
+      el(`saved-${kind}-frame-number`).textContent = "Frame - / -";
+    }
+    updateSavedButtons();
+    if (state) render(state);
+  }
+
+  function updateReviewButtons() {
+    const reviewable = connected && !archiveMode && state?.phase === "finished";
+    el("keep-episode").disabled = !reviewable;
+    el("discard-episode").disabled = !reviewable;
+  }
+
+  function selectedControlFrame() {
+    if (cachedControl) {
+      const index = Number(el("control-scrubber").value);
+      const step = cachedControl.frame_steps[index];
+      return Number.isInteger(step) ? {sequence: index + 1, step} : null;
+    }
+    if (!controlFrames.length) return null;
+    return controlFrames[Number(el("control-scrubber").value)] || null;
+  }
+
+  function updateScheduleButton() {
+    const frame = selectedControlFrame();
+    const allowed = ["ready", "policy", "paused", "intervening", "finished"].includes(state?.phase)
+      || (state?.phase === "preparing" && state?.control_cached);
+    const button = el("schedule-intervention");
+    button.disabled = archiveMode || !connected || scheduleSubmitting || !frame || !allowed;
+    button.textContent = scheduleSubmitting
+      ? "正在提交…"
+      : state?.scheduled_intervention_pending
+      ? `已预约 step ${state.scheduled_intervention_step}`
+      : (frame ? `此帧介入 · step ${frame.step}` : "此帧介入");
+  }
+
+  function handleMessage(event) {
+    if (event.data instanceof ArrayBuffer) {
+      const bytes = new Uint8Array(event.data);
+      const stream = bytes[0] === 67 ? "control" : "enabled";
+      const sequence = new DataView(event.data).getUint32(1, false);
+      const step = new DataView(event.data).getUint32(5, false);
+      const nextUrl = URL.createObjectURL(new Blob([bytes.subarray(9)], {type: "image/jpeg"}));
+      if (stream === "control") {
+        appendControlFrame(sequence, step, nextUrl);
+      } else {
+        appendEnabledFrame(sequence, nextUrl);
+      }
+      return;
+    }
+    const message = JSON.parse(event.data);
+    if (message.type === "state") render(message.state);
+    if (message.type === "command_ack") {
+      const request = pending.get(message.request_id);
+      if (request !== undefined) {
+        clearTimeout(request.timeout);
+        const rtt = performance.now() - request.sentAt;
+        el("latency").textContent = `${rtt.toFixed(1)} ms`;
+        pending.delete(message.request_id);
+        if (request.onAck) request.onAck(message);
+        if (request.payload.action === "schedule_intervention") {
+          scheduleSubmitting = false;
+          updateScheduleButton();
+          if (message.accepted) el("message").textContent = "服务器已接收，正在重置 enabled";
+        }
+      }
+      if (!message.accepted) el("message").textContent = message.detail;
+    }
+  }
+
+  function handleDisconnect() {
+    let hasRetryable = false;
+    for (const [requestId, request] of pending.entries()) {
+      clearTimeout(request.timeout);
+      request.timeout = null;
+      if (request.retryable) hasRetryable = true;
+      else pending.delete(requestId);
+    }
+    if (pending.size) el("message").textContent = "连接中断，正在自动重发此帧介入命令";
+    scheduleSubmitting = hasRetryable;
+    updateScheduleButton();
+    updateReviewButtons();
+    updateSavedButtons();
+  }
+
+  function armAckTimeout(requestId, request) {
+    clearTimeout(request.timeout);
+    request.timeout = setTimeout(() => {
+      if (!pending.has(requestId)) return;
+      if (!request.retryable) {
+        pending.delete(requestId);
+        if (request.payload.action === "schedule_intervention") scheduleSubmitting = false;
+      }
+      el("message").textContent = request.retryable
+        ? "命令 ACK 超时，正在重连并自动重发"
+        : "命令 ACK 超时，正在重连以核对后端状态";
+      updateScheduleButton();
+      updateReviewButtons();
+      updateSavedButtons();
+      socket?.close(4000, "command acknowledgement timeout");
+    }, 5000);
+  }
+
+  function transmit(requestId, request) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    request.sentAt = performance.now();
+    socket.send(JSON.stringify({
+      ...request.payload,
+      request_id: requestId,
+      client_time_ms: performance.now(),
+    }));
+    armAckTimeout(requestId, request);
+    return true;
+  }
+
+  function connect() {
+    if (socket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(socket.readyState)) return;
+    clearTimeout(reconnectTimer);
+    const nextSocket = new WebSocket(`${scheme}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+    socket = nextSocket;
+    nextSocket.binaryType = "arraybuffer";
+    el("connection").textContent = reconnectAttempt ? "正在重连…" : "连接中…";
+    nextSocket.onopen = () => {
+      if (socket !== nextSocket) return;
+      connected = true;
+      reconnectAttempt = 0;
+      el("connection").textContent = "已连接";
+      for (const [requestId, request] of pending.entries()) {
+        if (request.retryable) transmit(requestId, request);
+      }
+      updateScheduleButton();
+      updateReviewButtons();
+      updateSavedButtons();
+    };
+    nextSocket.onmessage = handleMessage;
+    nextSocket.onerror = () => {
+      if (socket === nextSocket) el("connection").textContent = "连接错误，正在重连…";
+    };
+    nextSocket.onclose = event => {
+      if (socket !== nextSocket) return;
+      connected = false;
+      handleDisconnect();
+      const delay = Math.min(500 * 2 ** reconnectAttempt, 5000);
+      reconnectAttempt += 1;
+      el("connection").textContent = `连接已断开（${event.code}），${delay}ms 后重连`;
+      reconnectTimer = setTimeout(connect, delay);
+    };
+  }
+
+  el("control-scrubber").addEventListener("input", event => {
+    const index = Number(event.target.value);
+    if (cachedControl) {
+      el("control-cache-video").pause();
+      showControlFrame(index);
+      return;
+    }
+    followControlTail = index === controlFrames.length - 1;
+    showControlFrame(index);
+  });
+
+  el("control-cache-video").addEventListener("timeupdate", event => {
+    if (!cachedControl || event.target.seeking) return;
+    const index = Math.min(
+      cachedControl.frame_steps.length - 1,
+      Math.max(0, Math.floor(event.target.currentTime * cachedControl.video_fps)),
+    );
+    el("control-scrubber").value = String(index);
+    el("control-frame-number").textContent = `Frame ${index + 1}/${cachedControl.frame_steps.length} · step ${cachedControl.frame_steps[index]} · cached`;
+    updateScheduleButton();
+  });
+
+  el("enabled-scrubber").addEventListener("input", event => {
+    const index = Number(event.target.value);
+    followEnabledTail = index === enabledFrames.length - 1;
+    showEnabledFrame(index);
+  });
+
+  function send(payload, retryable = false, onAck = null) {
+    if (!connected || !socket || socket.readyState !== WebSocket.OPEN) {
+      el("message").textContent = "尚未连接，命令未发送；正在自动重连";
+      connect();
+      return false;
+    }
+    const requestId = crypto.randomUUID();
+    const request = {sentAt: 0, payload, timeout: null, retryable, onAck};
+    pending.set(requestId, request);
+    return transmit(requestId, request);
+  }
+
+  el("set-next").addEventListener("click", () => {
+    send({action: "select_next", value: {task: el("next-task").value, seed: el("next-seed").value}});
+  });
+
+  el("schedule-intervention").addEventListener("click", () => {
+    const frame = selectedControlFrame();
+    if (frame) {
+      const submitted = send(
+        {action: "schedule_intervention", value: {step: frame.step, frame_sequence: frame.sequence}},
+        true,
+      );
+      if (submitted) {
+        scheduleSubmitting = true;
+        updateScheduleButton();
+      }
+    }
+  });
+
+  function blockCurrentSeed() {
+    if (confirm(`Block ${state?.task || "current task"} seed ${state?.seed ?? "-"} and discard this pair?`)) {
+      send({key: "b"});
+    }
+  }
+  el("block-seed").addEventListener("click", blockCurrentSeed);
+  el("view-saved").addEventListener("click", showSavedEntry);
+  el("refresh-saved").addEventListener("click", () => {
+    if (state?.task) loadSaved(state.task);
+  });
+  el("return-live").addEventListener("click", returnToLive);
+  el("saved-buffer").addEventListener("change", updateSavedButtons);
+  el("rerecord-saved").addEventListener("click", () => {
+    const entry = selectedSavedEntry();
+    if (!entry || !confirm(`重录 ${entry.task} ep${entry.episode} seed ${entry.seed}？旧数据会保留。`)) return;
+    returnToLive();
+    send(
+      {action: "select_next", value: {task: entry.task, seed: String(entry.seed)}},
+      false,
+      ack => {
+        if (ack.accepted) send({key: "n"});
+      },
+    );
+  });
+  el("keep-episode").addEventListener("click", () => send({key: "c"}));
+  el("discard-episode").addEventListener("click", () => send({key: "d"}));
+
+  window.addEventListener("keydown", event => {
+    if (event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || event.target instanceof HTMLVideoElement) return;
+    if (archiveMode) return;
+    if (event.repeat || !["s", "i", "z", "r", "n", "p", "c", "d", "b", "+", "-", "="].includes(event.key.toLowerCase())) return;
+    event.preventDefault();
+    if (event.key.toLowerCase() === "b") blockCurrentSeed();
+    else send({key: event.key});
+  });
+  connect();
+</script>
+</body>
+</html>

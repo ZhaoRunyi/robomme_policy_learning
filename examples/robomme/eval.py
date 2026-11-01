@@ -1,10 +1,12 @@
+from __future__ import annotations
+
 import dataclasses
 import json
 import os
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, Any, Tuple
+from typing import Optional, Any, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -18,8 +20,8 @@ from utils import (
     EpisodeState,
 )
 from utils import RolloutRecorder
-from env_runner import EnvRunner
-from subgoal_predictor import build_subgoal_predictor, SubgoalPredictorBase
+if TYPE_CHECKING:
+    from env_runner import EnvRunner
 
 # qwen3-vl environment variables
 os.environ['IMAGE_MAX_TOKEN_NUM'] = '256'
@@ -38,22 +40,24 @@ class Args:
     save_dir: str = "runs/evaluation"
     overwrite: bool = False
 
-    use_history: bool = True
+    # Policy identity and memory behavior.
     policy_name: str = "dummy_test"
     model_seed: int = 42
     model_ckpt_id: int = 80000
+    use_history: bool = True
     robottt_mode: Optional[str] = None
+
+    # Episode and task selection.
     episodes_per_task: Optional[int] = None
     episode_start: int = 0
     episode_stride: int = 1
-    dagger_dir: Optional[str] = None
-    dagger_dataset: str = "train"
-    dagger_stagnation_steps: int = 128
-
-    # task control
     re_eval_tasks: str = "" # tasks split by comma
     only_tasks: str = "" # tasks split by comma
     exclude_tasks: str = "" # tasks split by comma
+
+    # Optional DAgger recording.
+    dagger_dir: Optional[str] = None
+    dagger_dataset: str = "train"
 
     # VLM subgoal predictor
     use_oracle: bool = False
@@ -75,43 +79,43 @@ class EpisodeEvaluator:
     def __init__(self, args: Args, save_dir: Path):
         self.args = args
         self.save_dir = save_dir
+        self.reset_options = {}
 
     def eval_each_episode(
         self,
         env_runner: EnvRunner,
-        subgoal_predictor: SubgoalPredictorBase,
+        subgoal_predictor: Any | None,
         video_save_dir: Path,
     ) -> str:
         self.client = _websocket_client_policy.MMEVLAWebsocketClientPolicy(
             self.args.host, self.args.port
         )
-        client = self.client
-        resp = client.reset(self.args.robottt_mode)
+        resp = self.client.reset(**self.reset_options)
         while not resp.get("reset_finished", False):
             time.sleep(0.1)
 
-        epstate = EpisodeState()
-        task_goal, recorder = self.init_episode(env_runner, epstate, video_save_dir)
-        video_blocks = len(range(epstate.exec_start_idx % 16, epstate.exec_start_idx, 16))
         self.episode_metrics = {
-            "reset_time_ms": resp.get("reset_time_ms", 0), "video_blocks_seen": video_blocks,
+            "reset_time_ms": resp.get("reset_time_ms", 0),
             "prefill_time_ms": 0, "infer_time_ms": [],
         }
-        subgoal_predictor.start_episode(epstate, env_runner)        
+        epstate = EpisodeState()
+        task_goal, recorder = self.init_episode(env_runner, epstate, video_save_dir)
+        if subgoal_predictor is not None:
+            subgoal_predictor.start_episode(epstate, env_runner)
 
         img, wrist_img, robot_state = epstate.get_current_obs()
         prompt = task_goal
         success_flag = "unknown"
         subgoal = None
         last_subgoal = None
-        previous_progress = env_runner.subtask_progress
-        stagnant_steps = 0
-
         while True:
-            subgoal_predictor.step(epstate)
+            if subgoal_predictor is not None:
+                subgoal_predictor.step(epstate)
 
             if not epstate.action_plan:
-                if epstate.count % self.args.subgoal_keep_period == 0 or last_subgoal is None:
+                if subgoal_predictor is None:
+                    subgoal, has_api_error = None, False
+                elif epstate.count % self.args.subgoal_keep_period == 0 or last_subgoal is None:
                     subgoal, has_api_error = subgoal_predictor.get_subgoal(
                         epstate.count,
                         subgoal,
@@ -125,7 +129,7 @@ class EpisodeEvaluator:
                     break
 
                 action_chunk = self.get_action_chunk(
-                    client, epstate, img, wrist_img, robot_state, prompt, subgoal,
+                    self.client, epstate, img, wrist_img, robot_state, prompt, subgoal,
                     exec_horizon=self.args.obs_horizon
                 )
 
@@ -139,29 +143,13 @@ class EpisodeEvaluator:
             if stop_flag and success_flag == "error":
                 raise RuntimeError(f"{env_runner.info.get('exception_type')}: {env_runner.info.get('error_message')}")
             epstate.count += 1
-            progress = env_runner.subtask_progress
-            stagnant_steps = stagnant_steps + 1 if progress == previous_progress else 0
-            previous_progress = progress
-            if self.args.dagger_dir and (
-                env_runner.subtask_failed
-                or stagnant_steps >= self.args.dagger_stagnation_steps
-            ):
-                intervention_progress = env_runner.subtask_progress
-                expert_success = env_runner.finish_with_expert()
-                print(
-                    f"DAgger intervention: progress {intervention_progress}"
-                    f" -> {env_runner.subtask_progress}, success={expert_success}"
-                )
-                success_flag = "success" if expert_success else "fail"
-                break
-
             if epstate.count > self.args.max_steps:
                 success_flag = "timeout"
                 break
 
             img, wrist_img, robot_state = obs
 
-            epstate.add_observation(img, wrist_img, robot_state)
+            epstate.add_observation(img, wrist_img, robot_state, action)
             recorder.record(
                 image=img.copy(),
                 wrist_image=wrist_img.copy(),
@@ -175,33 +163,20 @@ class EpisodeEvaluator:
 
         if success_flag == "unknown":
             self.finish_metrics(epstate)
-            client.close()
+            self.client.close()
             return "unknown"
 
         video_filename = f"{env_runner.env_id}_ep{env_runner.episode_id}_{success_flag}_{task_goal}_{env_runner.difficulty}.mp4"
         recorder.save_video(video_filename)
 
-        subgoal_predictor.end_episode(epstate, success_flag)
+        if subgoal_predictor is not None:
+            subgoal_predictor.end_episode(epstate, success_flag)
         self.finish_metrics(epstate)
-        client.close()
+        self.client.close()
         return success_flag
 
     def finish_metrics(self, state):
-        metrics = self.episode_metrics
-        mode = self.args.robottt_mode or "normal"
-        updated_video = 0 if mode == "no_video" else metrics["video_blocks_seen"]
-        decisions = len(metrics["infer_time_ms"])
-        total_blocks = metrics["video_blocks_seen"] + decisions
-        metrics.update(
-            raw_env_steps=state.count,
-            policy_decisions=decisions,
-            video_blocks_updated=updated_video,
-            execution_blocks=decisions,
-            inner_valid_tokens=16 * updated_video + 36 * decisions,
-            first_extrapolated_block=96 if total_blocks > 96 else None,
-            extrapolated_blocks=max(total_blocks - 96, 0),
-        )
-
+        self.episode_metrics.update(raw_env_steps=state.count, policy_decisions=len(self.episode_metrics["infer_time_ms"]))
 
     def init_episode(
         self,
@@ -219,6 +194,7 @@ class EpisodeEvaluator:
         epstate.image_buffer.extend(pre_traj["images"])
         epstate.wrist_image_buffer.extend(pre_traj["wrist_images"])
         epstate.state_buffer.extend(pre_traj["states"])
+        epstate.action_buffer.extend(pre_traj["actions"])
 
         for i in range(len(pre_traj["images"])):
             recorder.record(
@@ -248,6 +224,7 @@ class EpisodeEvaluator:
             buffer = pack_buffer(
                 state.image_buffer,
                 state.state_buffer,
+                state.action_buffer,
                 state.exec_start_idx,
             )
             buffer.update(wrist_images=np.stack(state.wrist_image_buffer).astype(np.uint8)[:, None], prompt=prompt)
@@ -274,23 +251,21 @@ class EpisodeEvaluator:
         return action_chunk[:exec_horizon]
 
 
-def failure_reason(env_runner: EnvRunner, success_flag: str, error: Exception | None = None) -> dict:
-    info = getattr(env_runner, "info", {}) or {}
-    reason = {
-        "outcome": success_flag,
-        "subtask_progress": env_runner.subtask_progress,
-        "current_task_name": getattr(env_runner.env.unwrapped, "current_task_name", None),
-        "current_task_failure": env_runner.subtask_failed,
-    }
-    if success_flag == "timeout":
-        reason["type"] = "timeout"
-    elif info.get("status") == "error" or error is not None:
-        reason["type"] = "environment_error"
-        reason["exception_type"] = info.get("exception_type", type(error).__name__ if error else None)
-        reason["error_message"] = info.get("error_message", str(error) if error else None)
-    else:
-        reason["type"] = "task_failure"
-    return reason
+    @staticmethod
+    def summarize(progress, details=None):
+        success_rate = {
+            task: sum(results.values()) / len(results)
+            for task, results in progress.items() if not task.startswith("_")
+        }
+        output = {
+            "success_rate": success_rate,
+            "total_success_rate": sum(success_rate.values()) / len(success_rate),
+        }
+        if details is not None:
+            output["episode_details"] = details
+        return output
+
+
 
 
 def setup_save_directory(args: Args) -> Path:
@@ -361,6 +336,8 @@ def setup_log_dict(save_dir: Path, args: Args) -> dict:
 
 def evaluate(args: Args):
     """Main evaluation function."""
+    from env_runner import EnvRunner
+
     check_args(args)
     if args.robottt_mode not in (None, "normal", "no_video", "no_carry"):
         raise ValueError(f"Unsupported RoboTTT mode: {args.robottt_mode}")
@@ -386,18 +363,30 @@ def evaluate(args: Args):
         for task in args.exclude_tasks.split(","):
             log_dict[task] = {str(i): False for i in range(50)}
 
-    subgoal_predictor = build_subgoal_predictor(args, save_dir)
-    evaluator = EpisodeEvaluator(args, save_dir)
+    subgoal_predictor = None
+    if args.use_oracle or args.use_qwenvl or args.use_memer or args.use_gemini:
+        from subgoal_predictor import build_subgoal_predictor
+        subgoal_predictor = build_subgoal_predictor(args, save_dir)
+    evaluator_class = EpisodeEvaluator
+    if args.robottt_mode is not None:
+        from robottt_eval import RoboTTTEpisodeEvaluator
+        evaluator_class = RoboTTTEpisodeEvaluator
+    evaluator = evaluator_class(args, save_dir)
     for task_name in task_names:
         if task_name not in log_dict:
             log_dict[task_name] = {}
 
-        env_runner = EnvRunner(
+        runner_class = EnvRunner
+        runner_options = {}
+        if args.dagger_dir:
+            from dagger_review.env_runner import DAggerEnvRunner
+            runner_class = DAggerEnvRunner
+            runner_options = {"dagger_dir": args.dagger_dir, "dataset": args.dagger_dataset}
+        env_runner = runner_class(
             task_name,
             video_save_dir,
             max_steps=args.max_steps,
-            dagger_dir=args.dagger_dir,
-            dataset=args.dagger_dataset if args.dagger_dir else "test",
+            **runner_options,
         )
         num_episodes = min(env_runner.num_episodes, args.episodes_per_task or env_runner.num_episodes)
         success_flag = "unknown"
@@ -419,14 +408,14 @@ def evaluate(args: Args):
                 else:
                     log_dict[task_name][episode_id] = success_flag == "success"
                 if success_flag != "success":
-                    failure_reasons[episode_key] = failure_reason(env_runner, success_flag)
+                    failure_reasons[episode_key] = env_runner.failure_reason(success_flag)
                 if args.robottt_mode is not None:
                     details[episode_key] = evaluator.episode_metrics
             except Exception as e:
                 print(f"Error evaluating episode {episode_id} for task {task_name}: {e}")
                 log_dict[task_name][episode_id] = False if args.robottt_mode is not None else "error"
                 episode_key = f"{task_name}/{episode_id}"
-                failure_reasons[episode_key] = failure_reason(env_runner, "error", e)
+                failure_reasons[episode_key] = env_runner.failure_reason("error", e)
                 details[episode_key] = {"error": str(e)}
                 if hasattr(evaluator, "client"):
                     evaluator.client.close()
@@ -446,33 +435,18 @@ def evaluate(args: Args):
         time.sleep(1)
 
     try:
-        def wilson(successes, count):
-            probability = successes / count
-            center = (probability + 1.96**2 / (2 * count)) / (1 + 1.96**2 / count)
-            margin = 1.96 * np.sqrt(probability * (1 - probability) / count + 1.96**2 / (4 * count**2)) / (1 + 1.96**2 / count)
-            return [center - margin, center + margin]
-
-        final_results = {}
-        task_results = {key: value for key, value in log_dict.items() if not key.startswith("_")}
-        final_results["success_rate"] = {
-            task_name: sum(values.values()) / len(values)
-            for task_name, values in task_results.items()
-        }
-        final_results["total_success_rate"] = (
-            sum(final_results["success_rate"].values()) / len(final_results["success_rate"].values())
-        )
-        if args.robottt_mode is not None:
-            final_results["episode_details"] = details
-            final_results["wilson_95"] = {
-                task_name: wilson(sum(values.values()), len(values)) for task_name, values in task_results.items()}
-            all_results = [value for values in task_results.values() for value in values.values()]
-            final_results["total_wilson_95"] = wilson(sum(all_results), len(all_results))
-        with open(save_dir / "log.json", "w") as f:
-            json.dump(final_results, f, indent=2)
-    except Exception as e:
-        print(f"Error saving final results: {e}")
+        final_results = evaluator.summarize(log_dict, details if args.robottt_mode is not None else None)
+        (save_dir / "log.json").write_text(json.dumps(final_results, indent=2))
+    except Exception as error:
+        print(f"Error saving final results: {error}")
 
 
 if __name__ == "__main__":
+    import sys
     import tyro
-    tyro.cli(evaluate)
+
+    if sys.argv[1:2] == ["merge"]:
+        from robottt_eval import RoboTTTEpisodeEvaluator
+        tyro.cli(RoboTTTEpisodeEvaluator.merge_shards, args=sys.argv[2:])
+    else:
+        tyro.cli(evaluate)

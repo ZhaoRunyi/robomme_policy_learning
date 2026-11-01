@@ -103,8 +103,8 @@ class MME_VLA_Policy:
                 self._episode_fast_state = candidate_state
             self.step_idx += 1
         outputs = {"state": observation.state, "actions": actions}
+        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
         model_time = time.monotonic() - start_time
-        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)      
         outputs = self._output_transform(outputs)
         outputs["infer_time_ms"] = model_time * 1000
         return outputs
@@ -115,12 +115,38 @@ class MME_VLA_Policy:
         self._prepare_mem_buffer()
         self.step_idx = 0 if self._uses_robottt else -1
         self.exec_start_idx = 0
-        self._rng = jax.random.key(self._seed)
+        if (
+            not self._uses_robottt
+            or self._model.robottt_config.reset_rng_on_episode
+            or not hasattr(self, "_rng")
+        ):
+            self._rng = jax.random.key(self._seed)
         if self._uses_robottt:
             self._robottt_mode = robottt_mode
-            self._episode_fast_state = create_fast_state(1)
-            
-    
+            self._episode_fast_state = create_fast_state(1, self._model.robottt_config)
+        self._manual_dagger_reset_point = None
+
+    def save_reset_point(self) -> None:
+        if not self._uses_robottt:
+            raise RuntimeError("policy reset points require RoboTTT state")
+        self._manual_dagger_reset_point = {
+            "rng": self._rng,
+            "step_idx": self.step_idx,
+            "exec_start_idx": self.exec_start_idx,
+            "robottt_mode": self._robottt_mode,
+            "episode_fast_state": self._episode_fast_state,
+        }
+
+    def restore_reset_point(self) -> None:
+        if self._manual_dagger_reset_point is None:
+            raise RuntimeError("policy reset point has not been saved")
+        reset_point = self._manual_dagger_reset_point
+        self._rng = reset_point["rng"]
+        self.step_idx = reset_point["step_idx"]
+        self.exec_start_idx = reset_point["exec_start_idx"]
+        self._robottt_mode = reset_point["robottt_mode"]
+        self._episode_fast_state = reset_point["episode_fast_state"]
+
     def add_buffer(self, obs: dict) -> None:
         if self._uses_robottt:
             if self.step_idx:
@@ -129,30 +155,46 @@ class MME_VLA_Policy:
             self.step_idx = len(indices)
             if self._robottt_mode == "no_video":
                 return
-            segment_length = self.config.recurrent_memory.tbptt_segment_length
-            observations = [self._prepare_observation({
-                "observation/image": obs["images"][index, 0],
-                "observation/wrist_image": obs["wrist_images"][index, 0],
-                "observation/state": obs["state"][index],
-                "prompt": obs["prompt"],
-            }) for index in indices]
+            segment_length = self._model.robottt_config.tbptt_segment_length
+            video_actions = np.asarray(obs["actions"], dtype=np.float32)
+            observations = []
+            transformed_actions = []
+            for index in indices:
+                action_indices = np.minimum(
+                    index + np.arange(self._model.action_horizon), obs["exec_start_idx"] - 1
+                )
+                raw_actions = video_actions[action_indices]
+                transformed = self._input_transform({
+                    "observation/image": obs["images"][index, 0],
+                    "observation/wrist_image": obs["wrist_images"][index, 0],
+                    "observation/state": obs["state"][index],
+                    "actions": raw_actions,
+                    "prompt": obs["prompt"],
+                })
+                observations.append(HistAugObservation.from_dict(jax.tree.map(
+                    lambda value: jnp.asarray(value)[None], transformed
+                )))
+                transformed_actions.append(np.asarray(transformed["actions"]))
             if not observations:
                 return
             valid_blocks = len(observations)
             observations += [jax.tree.map(jnp.zeros_like, observations[0])] * (-valid_blocks % segment_length)
+            transformed_actions += [np.zeros_like(transformed_actions[0])] * (-valid_blocks % segment_length)
             observations = jax.tree.map(lambda *values: jnp.stack(values, axis=1), *observations)
+            transformed_actions = jnp.asarray(np.stack(transformed_actions))[None]
             for segment_index, start in enumerate(range(0, len(indices), segment_length)):
                 observation = jax.tree.map(lambda value: value[:, start:start + segment_length], observations)
+                actions = transformed_actions[:, start:start + segment_length]
                 valid_count = min(segment_length, valid_blocks - start)
                 valid = jnp.arange(segment_length)[None] < valid_count
                 masks = {
                     "valid": valid,
-                    "inner": valid[:, :, None] & (jnp.arange(36)[None, None] >= 20),
+                    "inner": jnp.repeat(valid[:, :, None], self._model.action_horizon + self._model.robottt_config.register_tokens, axis=-1),
                     "outer": jnp.zeros_like(valid),
                 }
                 _, _, self._episode_fast_state, _ = self._robottt_prefill(
                     self._rng, segment_index, observation,
-                    jnp.zeros((1, segment_length, 20, self._model.action_dim)), masks,
+                    actions, masks,
                     self._episode_fast_state, jnp.asarray([start], jnp.int32))
             return
         if self.mem_buffer is None:

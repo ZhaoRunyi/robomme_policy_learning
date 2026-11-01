@@ -63,12 +63,13 @@ def create_data_loader(
     seed: int = 0,
     temporal_blocks: int | None = None,
     start_step: int = 0,
+    register_tokens: int = 16,
 ) -> DataLoader[tuple[HistAugObservation, _model.Actions]]:
     
     history_config = get_history_config(history_config)
 
     if temporal_blocks is not None:
-        dataset = RoboTTTSequenceDataset(dataset_path, data_config, temporal_blocks)
+        dataset = RoboTTTSequenceDataset(dataset_path, data_config, temporal_blocks, register_tokens)
     else:
         dataset = RoboMMEDataset(dataset_path, data_config, history_config, action_horizon)
         dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)

@@ -91,6 +91,12 @@ class WebsocketPolicyServer:
                     tend = time.monotonic() - tstart
                     await websocket.send(packer.pack(
                         {"add_buffer_finished": True, "add_buffer_time_ms": tend * 1000}))
+                elif obs.get("save_reset_point", False):
+                    self._policy.save_reset_point()
+                    await websocket.send(packer.pack({"save_reset_point_finished": True}))
+                elif obs.get("restore_reset_point", False):
+                    self._policy.restore_reset_point()
+                    await websocket.send(packer.pack({"restore_reset_point_finished": True}))
                 else:
                     outputs = self._policy.infer(obs)
                     await websocket.send(packer.pack(outputs))
@@ -147,6 +153,14 @@ class WebsocketPolicyServer:
                         "add_buffer_finished": True,
                         "add_buffer_time_ms": (time.monotonic() - started) * 1000,
                     }
+                elif observation.get("save_reset_point", False):
+                    async with self._model_lock:
+                        self._batched_policy.save_reset_point(slot)
+                    output = {"save_reset_point_finished": True}
+                elif observation.get("restore_reset_point", False):
+                    async with self._model_lock:
+                        self._batched_policy.restore_reset_point(slot)
+                    output = {"restore_reset_point_finished": True}
                 else:
                     future = asyncio.get_running_loop().create_future()
                     await self._queue.put((slot, observation, future))

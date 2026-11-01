@@ -8,6 +8,7 @@ from typing import Literal, TypeAlias
 
 from openpi.models.gemma import PALIGEMMA_VOCAB_SIZE
 from openpi.models.gemma import Config
+from openpi.models.gemma import AdapterContext
 from openpi.models.gemma import Embedder
 from openpi.models.gemma import KVCache
 from openpi.models.gemma import RMSNorm
@@ -21,6 +22,7 @@ import openpi.training.sharding as sharding
 
 from mme_vla_suite.models.representation.utils import kernel_init_out_proj
 from mme_vla_suite.models.representation.robottt import RoboTTTLayer, create_fast_state
+from openpi.models.robottt import RoboTTTConfig
 from mme_vla_suite.models.integration.utils import _name
 from mme_vla_suite.models.integration.utils import Attention_with_MemoryExpert
 from mme_vla_suite.models.integration.utils import get_config, Variant
@@ -119,6 +121,7 @@ class HistoryBlock(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     integration_type: str | None = None
+    robottt_config: RoboTTTConfig = RoboTTTConfig()
     @nn.compact
     def __call__(
         self,
@@ -129,19 +132,16 @@ class HistoryBlock(nn.Module):
         adarms_cond,
         mem_seq,
         mem_mask,
-        robottt,
+        robottt_state,
         deterministic=True,
     ):  # noqa: FBT002
 
         if self.integration_type == "modulation":
             mem_attn = MemoryAttention(name="mem_attn")
 
-        robottt_fast_state, robottt_inner_mask, robottt_block_position, tbptt_segment_length = (
-            robottt
-        )
         temporal_shape = (
-            robottt_inner_mask.shape[:2]
-            if robottt_inner_mask is not None and robottt_inner_mask.ndim == 3
+            robottt_state.inner_mask.shape[:2]
+            if robottt_state.inner_mask is not None and robottt_state.inner_mask.ndim == 3
             else None
         )
         if temporal_shape is not None:
@@ -192,67 +192,13 @@ class HistoryBlock(nn.Module):
         ]
         xs = sharding.activation_sharding_constraint(xs)
 
+        robottt_fast_state = robottt_state.fast_state
         robottt_boundaries = None
         if self.integration_type == "layer" and xs[-1] is not None:
-            robottt_layer = RoboTTTLayer(name="robottt")
-            if temporal_shape is None:
-                xs[-1], robottt_fast_state = robottt_layer(
-                    xs[-1], robottt_fast_state,
-                    robottt_inner_mask, robottt_block_position,
-                )
-            else:
-                suffix = xs[-1].reshape((*temporal_shape, *xs[-1].shape[1:]))
-                segment_count = temporal_shape[1] // tbptt_segment_length
-
-                def segment_major(value):
-                    value = value.reshape(
-                        (
-                            temporal_shape[0],
-                            segment_count,
-                            tbptt_segment_length,
-                            *value.shape[2:],
-                        )
-                    )
-                    return jnp.swapaxes(value, 0, 1)
-
-                scan_inputs = (
-                    segment_major(suffix),
-                    segment_major(robottt_inner_mask),
-                    segment_major(robottt_block_position),
-                )
-
-                def update_segment(layer, state, inputs):
-                    hidden_slots, mask_slots, position_slots = inputs
-                    state = jax.tree.map(jax.lax.stop_gradient, state)
-                    boundary = state
-                    outputs = []
-                    for slot_index in range(tbptt_segment_length):
-                        hidden, state = layer(
-                            hidden_slots[:, slot_index],
-                            state,
-                            mask_slots[:, slot_index],
-                            position_slots[:, slot_index],
-                        )
-                        outputs.append(hidden)
-                    state = jax.tree.map(jax.lax.stop_gradient, state)
-                    return state, (jnp.stack(outputs, axis=1), boundary)
-
-                robottt_fast_state, (suffix, robottt_boundaries) = nn.scan(
-                    update_segment,
-                    variable_broadcast="params",
-                    split_rngs={"params": False},
-                    in_axes=0,
-                    out_axes=0,
-                    length=segment_count,
-                )(
-                    robottt_layer,
-                    robottt_fast_state,
-                    scan_inputs,
-                )
-                suffix = jnp.swapaxes(suffix, 0, 1).reshape(
-                    (temporal_shape[0], temporal_shape[1], *suffix.shape[3:])
-                )
-                xs[-1] = flatten_temporal(suffix)
+            layer = RoboTTTLayer(config=self.robottt_config, width=self.configs[-1].width, name="robottt")
+            suffix = xs[-1] if temporal_shape is None else xs[-1].reshape((*temporal_shape, *xs[-1].shape[1:]))
+            suffix, robottt_fast_state, robottt_boundaries = layer.apply_context(suffix, robottt_state)
+            xs[-1] = suffix.reshape(xs[-1].shape)
             robottt_fast_state = sharding.activation_sharding_constraint(robottt_fast_state)
 
         out = []
@@ -314,6 +260,7 @@ class Module(nn.Module):
     adarms: bool = False
     
     integration_type: str | None = None
+    robottt_config: RoboTTTConfig = RoboTTTConfig()
     def setup(self):
         # all experts must have the same depth
         assert all(config.depth == self.configs[0].depth for config in self.configs)
@@ -340,7 +287,7 @@ class Module(nn.Module):
                 nn.broadcast,
                 nn.broadcast,
                 nn.broadcast,
-                (0, nn.broadcast, nn.broadcast, nn.broadcast),
+                AdapterContext(0, nn.broadcast, nn.broadcast, nn.broadcast),
                 nn.broadcast,
             ),
             length=self.configs[0].depth,
@@ -350,6 +297,7 @@ class Module(nn.Module):
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
             integration_type=self.integration_type,
+            robottt_config=self.robottt_config,
         )
         self.final_norms = [
             RMSNorm(name=_name("final_norm", i) if self.integration_type != "expert" else _name("final_norm", i-1)) for i in range(len(self.configs))
@@ -371,18 +319,16 @@ class Module(nn.Module):
         kv_cache: KVCache | None = None,
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
-        robottt=None,
+        robottt_state: AdapterContext | None = None,
         deterministic: bool = True,
     ):
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[..., None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
-        if robottt is None:
-            robottt = (None, None, None, 1)
-        elif len(robottt) == 3:
-            robottt = (*robottt, 1)
-        temporal_robottt = robottt[1] is not None and robottt[1].ndim == 3
+        if robottt_state is None:
+            robottt_state = AdapterContext(None, None, None)
+        temporal_robottt = robottt_state.inner_mask is not None and robottt_state.inner_mask.ndim == 3
 
         embedded, (kv_cache, robottt_fast_state, robottt_boundaries) = self.layers(
             embedded,
@@ -392,7 +338,7 @@ class Module(nn.Module):
             adarms_cond,
             mem_seq,
             mem_mask,
-            robottt,
+            robottt_state,
             deterministic,
         )
 
@@ -444,10 +390,10 @@ class Module(nn.Module):
                 for c, m in zip(self.configs, mem_mods, strict=True)
             ],
             mem_mask=[jnp.ones((1, 4), dtype=bool) if m else None for m in mem_mods],
-            robottt=(
-                create_fast_state(1),
+            robottt_state=AdapterContext(
+                create_fast_state(1, self.robottt_config, depth=self.configs[0].depth, width=self.configs[-1].width),
                 jnp.ones((1, 1), dtype=bool),
                 jnp.zeros((1,), dtype=jnp.int32),
                 1,
-            ) if self.integration_type == "layer" else None,
+            ) if self.integration_type == "layer" else AdapterContext(None, None, None),
         )

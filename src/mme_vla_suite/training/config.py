@@ -438,6 +438,7 @@ class LeRobotMMEVLARealRobotDataConfig(DataConfigFactory):
         )
 
 import openpi.shared.array_typing as at
+from openpi.models.robottt import resolve_training_scope, TrainingScope
 from openpi.training.weight_loaders import WeightLoader, download, _merge_params
 @dataclasses.dataclass(frozen=True)
 class MMEVLAWeightLoader(WeightLoader):
@@ -530,7 +531,8 @@ class TrainConfig:
     resume_step: int | None = None
     
     dataset_path: str = "data/robomme"
-    train_robottt_only: bool = False
+    robottt_training_scope: TrainingScope | None = None
+    train_robottt_only: bool | None = None
     robottt_stage_steps: int | None = None
 
     @property
@@ -553,9 +555,26 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
-        if self.train_robottt_only:
-            object.__setattr__(self, "freeze_filter", nnx.Not(nnx.Any(
-                nnx.PathContains("robottt"), nnx.PathContains("robottt_register_tokens"))))
+        if "robottt" in str(getattr(self.model, "history_config", None)):
+            if self.robottt_stage_steps is not None:
+                settings = dataclasses.replace(self.model.robottt, curriculum={
+                    blocks: self.robottt_stage_steps for blocks in self.model.robottt.curriculum
+                })
+                object.__setattr__(self, "model", dataclasses.replace(self.model, robottt=settings))
+            scope = resolve_training_scope(self.robottt_training_scope, self.model.robottt, self.train_robottt_only)
+            object.__setattr__(self, "robottt_training_scope", scope)
+            ttt_filter = nnx.Any(nnx.PathContains("robottt"), nnx.PathContains("robottt_register_tokens"))
+            freeze_filter = {
+                "ttt_only": nnx.Not(ttt_filter),
+                "non_ttt_only": ttt_filter,
+                "all": nnx.Nothing(),
+            }[scope]
+            object.__setattr__(self, "freeze_filter", freeze_filter)
+
+    @property
+    def frozen_cast_filter(self):
+        # Frozen fast learners still need FP32 during differentiable inner updates.
+        return nnx.Nothing() if self.robottt_training_scope in ("non_ttt_only", "all") else self.freeze_filter
 
 
 OPENPI_DATA_HOME = os.getenv("OPENPI_DATA_HOME", "~/.cache/openpi")
@@ -584,7 +603,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         freeze_filter=history_pi0.HistoryPi0Config().get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            os.path.join(OPENPI_DATA_HOME, "openpi-assets/checkpoints/pi05_base/params"),
+            "/workspace/ttt_ws/ckpts/pi05_baseline/pi05_baseline/79999/params",
         ),
         num_train_steps=80_000, 
         save_interval=10_000,
@@ -616,7 +635,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         freeze_filter=history_pi0.HistoryPi0Config().get_freeze_filter(),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            os.path.join(OPENPI_DATA_HOME, "openpi-assets/checkpoints/pi05_base/params"),
+            "/workspace/ttt_ws/ckpts/pi05_baseline/pi05_baseline/79999/params",
         ),
         num_train_steps=80_000, 
         save_interval=10_000,
@@ -652,7 +671,7 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(weight_decay=1e-5),
         freeze_filter=nnx.Nothing(),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/workspace/ttt_ws/ckpts/pi05_base/params"
+            "/workspace/ttt_ws/ckpts/pi05_baseline/pi05_baseline/79999/params"
         ),
         num_train_steps=100_000,
         save_interval=10_000,
@@ -663,6 +682,61 @@ _CONFIGS = [
         dataset_path="/workspace/ttt_ws/data/manifests/robottt_manifest.json",
         assets_base_dir="/workspace/ttt_ws/runs/robottt/assets",
         checkpoint_base_dir="/workspace/ttt_ws/runs/robottt/ckpts",
+    ),
+    TrainConfig(
+        name="robomme_pi05_robottt_dagger_t96",
+        model=history_pi0.HistoryPi0Config(
+            pi05=True,
+            action_horizon=20,
+            use_history=True,
+            history_config="recurrent-robottt-layer.yaml",
+            discrete_state_input=False,
+        ),
+        data=RoboMMEDataConfig(
+            repo_id="robomme",
+            assets=AssetsConfig(
+                assets_dir="/workspace/ttt_ws/robomme_policy_learning/assets",
+                asset_id=".",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=100_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(weight_decay=1e-5),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/workspace/ttt_ws/ckpts/pi05_baseline/pi05_baseline/79999/params"
+        ),
+        num_train_steps=70_000,
+        save_interval=2_000,
+        keep_period=10_000,
+        num_workers=4,
+        ema_decay=0.999,
+        fsdp_devices=1,
+        resume_from_dir=(
+            "/workspace/ttt_ws/runs/robottt/train_logs/"
+            "robottt_frozen_pi05_baseline_10k_fast/robomme_pi05_robottt/"
+            "robottt_frozen_pi05_baseline_10k_fast"
+        ),
+        resume_step=60_000,
+        dataset_path=(
+            "/workspace/ttt_ws/data/manifests/"
+            "robottt_dagger_intervention_t96_manifest.json"
+        ),
+        train_robottt_only=True,
+        robottt_stage_steps=10_000,
+        assets_base_dir=(
+            "/workspace/ttt_ws/runs/robottt/train_logs/"
+            "robottt_frozen_dagger_intervention_t96_10k"
+        ),
+        checkpoint_base_dir=(
+            "/workspace/ttt_ws/runs/robottt/train_logs/"
+            "robottt_frozen_dagger_intervention_t96_10k"
+        ),
     ),
 ]
 

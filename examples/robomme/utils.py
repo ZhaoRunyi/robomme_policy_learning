@@ -39,12 +39,14 @@ SUBGOAL_TYPES = ("simple_subgoal", "grounded_subgoal")
 
 
 
-def pack_buffer(image_buffer, state_buffer, exec_start_idx=0):
+def pack_buffer(image_buffer, state_buffer, action_buffer, exec_start_idx=0):
     image_output = np.stack(image_buffer, axis=0).astype(np.uint8)[:, None]
     state_output = np.stack(state_buffer, axis=0).astype(np.float32)
+    action_output = np.stack(action_buffer, axis=0).astype(np.float32)
     return {
         "images": image_output,
         "state": state_output,
+        "actions": action_output,
         "add_buffer": True,
         "exec_start_idx": exec_start_idx,
     }
@@ -61,19 +63,28 @@ class EpisodeState:
         self.image_buffer = []
         self.wrist_image_buffer = []
         self.state_buffer = []
+        self.action_buffer = []
         self.action_plan = collections.deque()
         self.count = 0
         self.exec_start_idx = 0
 
-    def add_observation(self, img: np.ndarray, wrist_img: np.ndarray, state: np.ndarray):
+    def add_observation(
+        self,
+        img: np.ndarray,
+        wrist_img: np.ndarray,
+        state: np.ndarray,
+        action: np.ndarray,
+    ):
         self.image_buffer.append(img.copy())
         self.wrist_image_buffer.append(wrist_img.copy())
         self.state_buffer.append(state.copy())
+        self.action_buffer.append(action.copy())
 
     def clear_buffers(self):
         self.image_buffer.clear()
         self.wrist_image_buffer.clear()
         self.state_buffer.clear()
+        self.action_buffer.clear()
         self.exec_start_idx = 0
 
     def get_current_obs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

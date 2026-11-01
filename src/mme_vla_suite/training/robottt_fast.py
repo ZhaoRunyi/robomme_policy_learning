@@ -1,4 +1,4 @@
-"""Frozen π₀.₅ RoboTTT training with padding-aware packed S4 VJPs."""
+"""π₀.₅ RoboTTT training with padding-aware same-snapshot packed VJPs."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import openpi.training.sharding as sharding
 
 from mme_vla_suite.models.integration.history_observation import preprocess_observation
 from mme_vla_suite.models.integration.history_pi0 import make_attn_mask
+from openpi.models.gemma import AdapterContext
 from mme_vla_suite.models.representation.robottt import create_fast_state
 
-PACKED_SEGMENTS = 32
 IMAGE_LOOKUP = (
     np.arange(256, dtype=np.uint8).astype(np.float32) / 255.0 * 2.0 - 1.0
 )
@@ -39,7 +39,7 @@ class LaneContext(NamedTuple):
 
 
 def make_boundary_transport_jit(function, mesh, *, donate_argnums=()):
-    """Shard only the P32 fast-state boundary rows across data devices."""
+    """Shard only the packed fast-state boundary rows across data devices."""
     replicated = jax.sharding.NamedSharding(
         mesh, jax.sharding.PartitionSpec()
     )
@@ -238,8 +238,8 @@ def collect_lane(config, train_state, prepared, masks, segment_length):
         positions=suffix_positions,
         mask=suffix_attention_mask,
         adarms_cond=[None, adarms_cond],
-        robottt=(
-            create_fast_state(batch_size),
+        robottt_state=AdapterContext(
+            create_fast_state(batch_size, model.robottt_config),
             masks["inner"],
             block_positions,
             segment_length,
@@ -313,34 +313,81 @@ def pack_context(
     )
 
 
-def merge_packed(left, right, left_count):
-    """Fill one P32 batch with valid rows from two lane-local packs."""
-    output_rows = jnp.arange(PACKED_SEGMENTS)
+def merge_packed_rows(left_value, right_value, left_count):
+    """Merge packed rows without materializing a stacked pair."""
+    packed_segments = left_value.shape[0]
+    output_rows = jnp.arange(packed_segments)
     use_right = output_rows >= left_count
-    source = use_right.astype(jnp.int32)
-    rows = jnp.where(use_right, output_rows - left_count, output_rows)
+    right_rows = jnp.maximum(output_rows - left_count, 0)
+    use_right_rows = use_right.reshape(
+        (packed_segments, *([1] * (left_value.ndim - 1)))
+    )
+    return jnp.where(
+        use_right_rows,
+        right_value[right_rows],
+        left_value[output_rows],
+    )
 
-    def gather(left_value, right_value):
-        values = jnp.stack((left_value, right_value))
-        return values[source, rows]
 
-    def gather_layer(left_value, right_value):
-        values = jnp.stack((left_value, right_value))
-        return jnp.swapaxes(values[source, :, rows], 0, 1)
+def merge_packed_layer_rows(left_value, right_value, left_count):
+    """Merge packed rows on axis one for layer-major boundary state."""
+    packed_segments = left_value.shape[1]
+    output_rows = jnp.arange(packed_segments)
+    use_right = output_rows >= left_count
+    right_rows = jnp.maximum(output_rows - left_count, 0)
+    use_right_rows = use_right.reshape(
+        (1, packed_segments, *([1] * (left_value.ndim - 2)))
+    )
+    return jnp.where(
+        use_right_rows,
+        right_value[:, right_rows],
+        left_value[:, output_rows],
+    )
+
+
+def merge_packed(left, right, left_count):
+    """Fill one packed batch with valid rows from two lane-local packs."""
 
     return LaneContext(
-        jax.tree.map(gather, left.prepared, right.prepared),
-        jax.tree.map(gather, left.masks, right.masks),
-        jax.tree.map(gather_layer, left.prefix_kv, right.prefix_kv),
-        gather(left.suffix_positions, right.suffix_positions),
-        gather(
-            left.suffix_attention_mask,
-            right.suffix_attention_mask,
+        jax.tree.map(
+            lambda left_value, right_value: merge_packed_rows(
+                left_value, right_value, left_count
+            ),
+            left.prepared,
+            right.prepared,
         ),
         jax.tree.map(
-            gather_layer, left.boundary_states, right.boundary_states
+            lambda left_value, right_value: merge_packed_rows(
+                left_value, right_value, left_count
+            ),
+            left.masks,
+            right.masks,
         ),
-        gather(left.boundary_positions, right.boundary_positions),
+        jax.tree.map(
+            lambda left_value, right_value: merge_packed_layer_rows(
+                left_value, right_value, left_count
+            ),
+            left.prefix_kv,
+            right.prefix_kv,
+        ),
+        merge_packed_rows(
+            left.suffix_positions, right.suffix_positions, left_count
+        ),
+        merge_packed_rows(
+            left.suffix_attention_mask,
+            right.suffix_attention_mask,
+            left_count,
+        ),
+        jax.tree.map(
+            lambda left_value, right_value: merge_packed_layer_rows(
+                left_value, right_value, left_count
+            ),
+            left.boundary_states,
+            right.boundary_states,
+        ),
+        merge_packed_rows(
+            left.boundary_positions, right.boundary_positions, left_count
+        ),
     )
 
 
@@ -368,6 +415,20 @@ def packed_grad(
             prepared.noisy_actions,
             prepared.time,
         )
+        prefix_kv = packed.prefix_kv
+        if config.robottt_training_scope != "ttt_only":
+            # A cached, detached prefix is valid only while its parameters are frozen.
+            prefix_tokens, prefix_mask, prefix_ar, prefix_na, _ = model.embed_prefix(observation)
+            prefix_result = model.PaliGemma.llm(
+                [prefix_tokens, None],
+                mask=make_attn_mask(prefix_mask, prefix_ar, prefix_na),
+                positions=jnp.cumsum(prefix_mask, axis=1) - 1,
+                deterministic=model.deterministic,
+            )
+            prefix_kv = jax.tree.map(
+                lambda value: value.reshape((value.shape[0], batch_size, segment_length, *value.shape[2:])),
+                prefix_result[1],
+            )
         valid = packed.masks["valid"].astype(jnp.int32)
         block_positions = (
             packed.boundary_positions[:, None]
@@ -376,11 +437,11 @@ def packed_grad(
         )
         result = model.PaliGemma.llm(
             [None, suffix_tokens],
-            kv_cache=packed.prefix_kv,
+            kv_cache=prefix_kv,
             positions=packed.suffix_positions,
             mask=packed.suffix_attention_mask,
             adarms_cond=[None, adarms_cond],
-            robottt=(
+            robottt_state=AdapterContext(
                 packed.boundary_states,
                 packed.masks["inner"],
                 block_positions,
@@ -405,14 +466,14 @@ def packed_grad(
         return numerator, count
 
     diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss_for_grad = nnx.remat(loss_fn) if model.robottt_config.packed_loss_remat else loss_fn
     (numerator, count), gradients = nnx.value_and_grad(
-        loss_fn, argnums=diff_state, has_aux=True
+        loss_for_grad, argnums=diff_state, has_aux=True
     )(model)
     if gradient_sum is None:
         return gradients, numerator, count
-    gradients, numerator, count = jax.lax.optimization_barrier(
-        (gradients, numerator, count)
-    )
+    if model.robottt_config.packed_gradient_barrier:
+        gradients, numerator, count = jax.lax.optimization_barrier((gradients, numerator, count))
     return (
         jax.tree.map(jnp.add, gradient_sum, gradients),
         numerator_sum + numerator,
@@ -447,6 +508,8 @@ def padding_plan(valid, microbatch_size, lane_group_size, segment_length):
 
 def alias_frozen_ema(config, train_state):
     """Alias frozen EMA leaves to frozen parameter buffers."""
+    if train_state.ema_params is None:
+        return train_state
     trainable_ema, _ = train_state.ema_params.split(
         config.trainable_filter, ...
     )

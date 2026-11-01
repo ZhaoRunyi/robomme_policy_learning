@@ -49,9 +49,7 @@ def initialize_checkpoint_dir(
         item_handlers=handlers,
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
-            keep_period=None if full_state else keep_period,
-            should_keep_fn=(lambda step: 50_000 <= step <= 100_000 and step % 10_000 == 0)
-            if full_state and not read_only else None,
+            keep_period=keep_period,
             create=False,
             read_only=read_only,
             async_options=ocp.AsyncOptions(timeout_secs=7200),

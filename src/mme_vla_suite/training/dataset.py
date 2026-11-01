@@ -281,13 +281,14 @@ class RoboMMEDataset(Dataset):
 
 
 class RoboTTTSequenceDataset(Dataset):
-    def __init__(self, manifest_path, data_config, temporal_blocks):
+    def __init__(self, manifest_path, data_config, temporal_blocks, register_tokens=16):
         manifest = json.load(open(manifest_path))
         if manifest["max_phase_aligned_blocks"] > 96:
             raise ValueError("RoboTTT manifest exceeds the approved T96 horizon")
         self.episodes = manifest["episodes"]
         self.ends = [episode["cumulative_execution_count"] for episode in self.episodes]
         self.temporal_blocks = temporal_blocks
+        self.inner_width = 20 + register_tokens
         self.files = {}
         model_transforms = data_config.model_transforms.inputs
         self.transform = _transforms.compose(
@@ -327,25 +328,25 @@ class RoboTTTSequenceDataset(Dataset):
                 if "action_source" in timestep["info"]
                 else True
             )
-            action_indices = np.minimum(block_index + np.arange(20), episode["num_steps"] - 1)
+            action_end = episode["exec_start_idx"] if video else episode["num_steps"]
+            action_indices = np.minimum(block_index + np.arange(20), action_end - 1)
+            actions = np.stack([
+                episode_group[f"timestep_{step}"]["action/joint_action"][()]
+                for step in action_indices
+            ]).astype(np.float32)
             sample = {
                 "observation/image": timestep["obs/front_rgb"][()],
                 "observation/wrist_image": timestep["obs/wrist_rgb"][()],
                 "observation/state": np.concatenate(
                     [timestep["obs/joint_state"][()], timestep["obs/gripper_state"][()][:1]]
                 ).astype(np.float32),
-                "actions": np.stack([
-                    episode_group[f"timestep_{step}"]["action/joint_action"][()]
-                    for step in action_indices
-                ]).astype(np.float32),
+                "actions": actions,
                 "prompt": episode["task_goal"],
             }
             block = self.transform(sample)
             block = {key: value for key, value in block.items() if value is not None}
             block.pop("prompt", None)
             block.update({key: tokenized[key] for key in ("tokenized_prompt", "tokenized_prompt_mask")})
-            if video:
-                block["actions"][:] = 0
             blocks.append(block)
             outer_mask.append(not video and action_source)
         sequence = jax.tree.map(lambda *values: np.stack(values), *blocks)
@@ -357,9 +358,7 @@ class RoboTTTSequenceDataset(Dataset):
             sequence,
         )
         valid = np.pad(np.ones(len(block_indices), dtype=np.bool_), padding)
-        video_mask = np.pad(is_video, padding)
-        inner_mask = np.repeat(valid[..., None], 36, axis=-1)
-        inner_mask[video_mask, :20] = False
+        inner_mask = np.repeat(valid[..., None], self.inner_width, axis=-1)
         packed["robottt"] = {
             "valid": valid,
             "inner": inner_mask,

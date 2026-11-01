@@ -27,7 +27,7 @@ We follow this einsum axis naming convention:
 
 from collections.abc import Sequence
 import dataclasses
-from typing import Literal, TypeAlias
+from typing import Literal, NamedTuple, TypeAlias
 
 import einops
 import flax.linen as nn
@@ -39,6 +39,15 @@ import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
 PALIGEMMA_VOCAB_SIZE = 257_152
+
+
+class AdapterContext(NamedTuple):
+    """Per-call dynamic carry; segment_length is a static scan grouping."""
+
+    fast_state: object | None
+    inner_mask: jax.Array | None
+    block_position: jax.Array | None
+    segment_length: int = 1
 
 
 @dataclasses.dataclass

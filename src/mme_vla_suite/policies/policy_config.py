@@ -1,3 +1,4 @@
+import json
 import logging
 import pathlib
 from typing import Any
@@ -11,7 +12,25 @@ from openpi.training import checkpoints as _checkpoints
 import openpi.transforms as transforms
 
 import mme_vla_suite.policies.policy as _policy
+from openpi.models.robottt import config_from_candidate
 import mme_vla_suite.training.config as _config
+
+
+def _read_checkpoint_file(checkpoint_dir: pathlib.Path, name: str) -> str | None:
+    for path in (checkpoint_dir.parent / name, checkpoint_dir / name):
+        if path.exists():
+            return path.read_text().strip()
+    return None
+
+
+def _load_candidate(checkpoint_dir: pathlib.Path) -> dict[str, Any] | None:
+    raw_candidate = _read_checkpoint_file(checkpoint_dir, "candidate.json")
+    if raw_candidate is None:
+        return None
+    candidate = json.loads(raw_candidate)
+    if not isinstance(candidate, dict):
+        raise ValueError("candidate.json must contain a JSON object")
+    return candidate
 
 
 def create_trained_policy(
@@ -24,27 +43,67 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
 ) -> _policy.MME_VLA_Policy:
-    
+    checkpoint_dir = pathlib.Path(checkpoint_dir)
     repack_transforms = repack_transforms or transforms.Group()
-    
+
     logging.info(f"Checking history config")
-    history_config = None
-    history_config_path = checkpoint_dir.parent / "history_config.txt"
-    if history_config_path.exists():
-        with open(history_config_path, "r") as f:
-            history_config = f.read()
-    
+    history_config = _read_checkpoint_file(checkpoint_dir, "history_config.txt")
+    if history_config is None and train_config.model.history_config is not None:
+        raise FileNotFoundError(
+            "Checkpoint history_config.txt is missing; refusing to silently "
+            "disable the configured history/RoboTTT model"
+        )
+
     if train_config.model.history_config != history_config:
         print(f" == You are using {train_config.model.history_config}, changing to {history_config} ==")
         train_config = dataclasses.replace(
-            train_config, 
+            train_config,
             model=dataclasses.replace(train_config.model, history_config=history_config, use_history=history_config is not None)
         )
-    
+
+    candidate = _load_candidate(checkpoint_dir)
+    if "robottt" in str(history_config):
+        if candidate is None:
+            raise FileNotFoundError("RoboTTT checkpoint requires candidate.json beside its numbered checkpoints")
+        settings = config_from_candidate(train_config.model.robottt, candidate)
+        train_config = dataclasses.replace(
+            train_config,
+            model=dataclasses.replace(train_config.model, robottt=settings),
+            robottt_training_scope=candidate.get("training_scope", train_config.robottt_training_scope),
+            train_robottt_only=None,
+        )
 
     logging.info("Loading model...")
     restore_dtype = None if "robottt" in str(train_config.model.history_config) else jnp.bfloat16
     model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=restore_dtype))
+    expected_robottt = "robottt" in str(history_config)
+    if bool(model.use_robottt) != expected_robottt:
+        raise RuntimeError(
+            f"RoboTTT restore mismatch: expected={expected_robottt}, "
+            f"actual={model.use_robottt}"
+        )
+    register_tokens = None
+    if model.use_robottt:
+        register_tokens = int(model.robottt_register_tokens.value.shape[0])
+    expected_register_tokens = None if candidate is None else candidate.get("register_tokens")
+    if expected_register_tokens is not None and register_tokens != int(expected_register_tokens):
+        raise RuntimeError(
+            f"RoboTTT register-token mismatch: expected={expected_register_tokens}, "
+            f"actual={register_tokens}"
+        )
+    effective_inner_lr_scale = train_config.model.robottt.fast_learning_rate
+    print(
+        "EVAL_CONTRACT "
+        f"checkpoint={checkpoint_dir} "
+        f"history_config={history_config} "
+        f"uses_robottt={model.use_robottt} "
+        f"inner_lr_scale={effective_inner_lr_scale} "
+        f"register_tokens={register_tokens} "
+        f"video_action_source=ground_truth "
+        f"fast_model={train_config.model.robottt.fast_model} "
+        f"fast_update={train_config.model.robottt.fast_update} "
+        f"operation_order={train_config.model.robottt.operation_order}"
+    )
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     
     if norm_stats is None:
